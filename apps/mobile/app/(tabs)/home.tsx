@@ -6,11 +6,14 @@ import { StatusBanner } from '../../src/components/StatusBanner';
 import { ModeBadge } from '../../src/components/ModeBadge';
 import { useApp } from '../../src/state/AppContext';
 import { useCart } from '../../src/state/CartContext';
+import { useAlerts } from '../../src/state/AlertsContext';
+import { badgeText } from '../../src/lib/low-stock';
 import { formatMxDateTime } from '@amara/shared';
 
 export default function Home() {
   const app = useApp();
   const cart = useCart();
+  const alerts = useAlerts();
   const router = useRouter();
   if (!app.session || !app.device) return <Loading />;
 
@@ -35,6 +38,10 @@ export default function Home() {
       <Button title="Consultar inventario" variant="secondary" onPress={() => router.push('/inventory')} />
       <Button title="Tickets" variant="secondary" onPress={() => router.push('/tickets')} />
       {app.can('estadisticas.ver') ? <Button title="Resumen de ventas de hoy" variant="secondary" onPress={() => router.push('/summary')} /> : null}
+      {app.can('estadisticas.ver') ? <Button title="Panel administrativo" variant="dark" onPress={() => router.push('/admin')} /> : null}
+      {app.can('estadisticas.ver') && alerts.enabled ? (
+        <Button title={alerts.counts.total > 0 ? `Notificaciones (${badgeText(alerts.counts.total)})` : 'Notificaciones'} variant="secondary" onPress={() => router.push('/notifications')} />
+      ) : null}
 
       <Spacer h={4} />
       <Card>

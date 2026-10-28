@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { ReportAdjustment, ReportSale } from '@amara/shared';
 import {
-  addDays, addMonths, buildDashboard, classifyStock, dailySeries, mondayOf, periodReport, RangeInputError, resolveRange, stockState, todayRange, toReportSale,
+  addDays, addMonths, buildDashboard, bucketsInRange, classifyStock, dailySeries, lowStockItems, mondayOf, periodReport, productSeries, RangeInputError, resolveRange, resolverFrom,
+  stockState, todayRange, toReportAdjustment, toReportSale, topProductsSeries,
 } from '../src/stats.ts';
 
 const sale = (id: string, createdAt: string, total: number, method: 'efectivo' | 'tarjeta' = 'efectivo', branchId = 'b1', qty = 1, cost = 4000): ReportSale => ({
@@ -101,7 +102,7 @@ describe('series, informes y tablero', () => {
 
   it('toReportSale elimina campos internos y mantiene los necesarios para el informe', () => {
     const r = toReportSale({ _id: 'x', branchId: 'b', createdAt: 'c', totalCents: 5, payments: [{ method: 'efectivo', amountCents: 5, tenderedCents: 10 }], items: [{ variantId: 'v', productName: 'p', variantLabel: 'l', qty: 1, unitCostCents: 1, netCents: 5, sku: 'x' }], receivedAt: 'z' });
-    expect(r).toEqual({ id: 'x', branchId: 'b', createdAt: 'c', totalCents: 5, payments: [{ method: 'efectivo', amountCents: 5 }], items: [{ variantId: 'v', productName: 'p', variantLabel: 'l', qty: 1, unitCostCents: 1, netCents: 5 }] });
+    expect(r).toEqual({ id: 'x', branchId: 'b', createdAt: 'c', totalCents: 5, payments: [{ method: 'efectivo', amountCents: 5 }], items: [{ variantId: 'v', productName: 'p', variantLabel: 'l', qty: 1, unitCostCents: 1, netCents: 5, kind: 'producto' }] });
   });
 });
 
@@ -132,5 +133,115 @@ describe('existencias bajas y agotadas', () => {
     );
     expect(r.out.map((x) => x.productName)).toEqual(['Vela']);
     expect(r.low.map((x) => `${x.branchId}:${x.qty}`)).toEqual(['b2:1', 'b1:2']);
+  });
+});
+
+
+describe('v2: extras y series por producto', () => {
+  const variants = new Map([
+    ['v1', { productId: 'p1', productName: 'Vela' }],
+    ['v1b', { productId: 'p1', productName: 'Vela' }],
+    ['v2', { productId: 'p2', productName: 'Incienso' }],
+  ]);
+  const resolve = resolverFrom(variants);
+  const line = (variantId: string, name: string, qty: number, net: number, kind: 'producto' | 'extra' = 'producto') => ({
+    variantId, productName: name, variantLabel: 'x', qty, unitCostCents: kind === 'extra' ? 0 : 1000, netCents: net, kind,
+  });
+  const mk = (id: string, createdAt: string, items: ReturnType<typeof line>[]): ReportSale => ({
+    id, branchId: 'b1', createdAt, totalCents: items.reduce((a, i) => a + i.netCents, 0), payments: [{ method: 'efectivo', amountCents: items.reduce((a, i) => a + i.netCents, 0) }], items,
+  });
+  const sales = [
+    mk('s1', '2026-10-20T18:00:00.000Z', [line('v1', 'Vela', 3, 9000), line('v2', 'Incienso', 1, 2000)]),
+    mk('s2', '2026-10-20T19:00:00.000Z', [line('v1b', 'Vela', 2, 6000), line('v1', 'Vela', 1, 2500, 'extra')]),
+    mk('s3', '2026-10-22T18:00:00.000Z', [line('v2', 'Incienso', 4, 8000)]),
+    mk('s4', '2026-09-30T18:00:00.000Z', [line('v2', 'Incienso', 9, 18000)]),
+  ];
+  const refund: ReportAdjustment = {
+    id: 'a1', saleId: 's1', branchId: 'b1', type: 'devolucion', createdAt: '2026-10-22T20:00:00.000Z', amountCents: 3000, payments: [{ method: 'efectivo', amountCents: 3000 }],
+    items: [{ variantId: 'v1', productName: 'Vela', variantLabel: 'x', qty: 1, unitCostCents: 1000, netCents: 3000, restock: true, kind: 'producto' }],
+  };
+
+  it('kind viaja de los documentos a los informes y por omisión es producto', () => {
+    const doc = { _id: 'x', branchId: 'b1', createdAt: '2026-10-20T18:00:00.000Z', totalCents: 1, payments: [], items: [{ variantId: 'v', productName: 'A', variantLabel: 'a', qty: 1, unitCostCents: 0, netCents: 1, kind: 'extra' }, { variantId: 'v', productName: 'A', variantLabel: 'a', qty: 1, unitCostCents: 0, netCents: 1 }] };
+    expect(toReportSale(doc).items.map((i) => i.kind)).toEqual(['extra', 'producto']);
+    expect(toReportAdjustment({ ...doc, items: doc.items.map((i) => ({ ...i, restock: false })) }).items.map((i) => i.kind)).toEqual(['extra', 'producto']);
+  });
+
+  it('cubetas del rango: días y meses, incluso vacíos', () => {
+    expect(bucketsInRange('day', '2026-10-19', '2026-10-21')).toEqual(['2026-10-19', '2026-10-20', '2026-10-21']);
+    expect(bucketsInRange('month', '2026-08-15', '2026-10-02')).toEqual(['2026-08', '2026-09', '2026-10']);
+  });
+
+  it('top por día: agrupa variantes del mismo producto, el extra suma importe y no unidades, y la devolución resta en su fecha', () => {
+    const r = topProductsSeries(sales.slice(0, 3), [refund], resolve, { granularity: 'day', fromDay: '2026-10-20', toDay: '2026-10-22', limit: 5 });
+    expect(r.buckets.map((b) => b.bucket)).toEqual(['2026-10-20', '2026-10-21', '2026-10-22']);
+    const d20 = r.buckets[0]!;
+    expect(d20.topProduct).toEqual({ name: 'Vela', qty: 5 });
+    expect(d20.products.find((p) => p.productId === 'p1')).toEqual({ productId: 'p1', name: 'Vela', qty: 5, netCents: 9000 + 6000 + 2500 });
+    expect(r.buckets[1]!.topProduct).toBeNull();
+    const d22 = r.buckets[2]!;
+    expect(d22.topProduct).toEqual({ name: 'Incienso', qty: 4 });
+    expect(d22.products.map((p) => p.productId)).toEqual(['p2']); // Vela quedó en -1: no aparece
+    const vela = r.series.find((s) => s.productId === 'p1')!;
+    expect(vela.points.map((p) => p.qty)).toEqual([5, 0, -1]);
+    expect(vela.points.map((p) => p.netCents)).toEqual([17500, 0, -3000]);
+  });
+
+  it('top: respeta el límite y ordena la serie por unidades de todo el rango', () => {
+    const r = topProductsSeries(sales, [], resolve, { granularity: 'month', fromDay: '2026-09-01', toDay: '2026-10-31', limit: 1 });
+    expect(r.buckets.map((b) => b.bucket)).toEqual(['2026-09', '2026-10']);
+    expect(r.buckets[0]!.topProduct).toEqual({ name: 'Incienso', qty: 9 });
+    expect(r.buckets[1]!.products).toHaveLength(1);
+    expect(r.series).toHaveLength(1);
+    expect(r.series[0]!.productId).toBe('p2'); // 13 unidades contra 5
+    expect(r.series[0]!.points.map((p) => p.qty)).toEqual([9, 5]);
+  });
+
+  it('sin ventas: cubetas vacías y sin series', () => {
+    const r = topProductsSeries([], [], resolve, { granularity: 'day', fromDay: '2026-10-01', toDay: '2026-10-02', limit: 5 });
+    expect(r.series).toEqual([]);
+    expect(r.buckets.every((b) => b.topProduct === null && b.products.length === 0)).toBe(true);
+  });
+
+  it('una variante borrada usa su id y el nombre guardado en la venta', () => {
+    const r = topProductsSeries([mk('s9', '2026-10-20T18:00:00.000Z', [line('vX', 'Antiguo', 2, 500)])], [], resolve, { granularity: 'day', fromDay: '2026-10-20', toDay: '2026-10-20', limit: 5 });
+    expect([r.series[0]!.productId, r.series[0]!.name]).toEqual(['vX', 'Antiguo']);
+  });
+
+  it('serie de un producto: puntos, totales netos y últimas ventas del mes con su folio', () => {
+    const r = productSeries(sales, [refund], resolve, new Map([['s1', 'AMA-1'], ['s2', 'AMA-2']]), { productId: 'p1', granularity: 'day', fromDay: '2026-10-20', toDay: '2026-10-22' });
+    expect(r.points).toEqual([
+      { bucket: '2026-10-20', qty: 5, netCents: 17500 },
+      { bucket: '2026-10-21', qty: 0, netCents: 0 },
+      { bucket: '2026-10-22', qty: -1, netCents: -3000 },
+    ]);
+    expect(r.totalQty).toBe(4);
+    expect(r.totalNetCents).toBe(14500);
+    expect(r.last.map((l) => l.folio)).toEqual(['AMA-2', 'AMA-1']);
+    expect(r.last[0]).toEqual({ saleId: 's2', folio: 'AMA-2', createdAt: '2026-10-20T19:00:00.000Z', qty: 2, netCents: 8500 });
+  });
+
+  it('serie de una variante: ignora las demás variantes del producto; sin folio cae al id; solo ventas del mes final', () => {
+    const r = productSeries(sales, [], resolve, new Map(), { variantId: 'v1b', granularity: 'month', fromDay: '2026-09-01', toDay: '2026-10-31' });
+    expect(r.points).toEqual([{ bucket: '2026-09', qty: 0, netCents: 0 }, { bucket: '2026-10', qty: 2, netCents: 6000 }]);
+    expect(r.last).toEqual([{ saleId: 's2', folio: 's2', createdAt: '2026-10-20T19:00:00.000Z', qty: 2, netCents: 6000 }]);
+    const sep = productSeries(sales, [], resolve, new Map(), { productId: 'p2', granularity: 'month', fromDay: '2026-09-01', toDay: '2026-09-30' });
+    expect(sep.totalQty).toBe(9);
+    expect(sep.last.map((l) => l.saleId)).toEqual(['s4']);
+  });
+
+  it('lowStockItems: bajo mínimo, agotados con mínimo, negativos heredados; ignora inactivas y sin mínimo; ordena por urgencia', () => {
+    const info = (name: string, minStock: number, active = true) => ({ productId: `p-${name}`, productName: name, label: 'u', category: 'Veladoras', minStock, active });
+    const vs = new Map([
+      ['a', info('A', 10)], ['b', info('B', 10)], ['c', info('C', 0)], ['d', info('D', 5, false)], ['e', info('E', 4)], ['f', info('F', 0)], ['g', info('G', 10)],
+    ]);
+    const rows = [
+      { variantId: 'a', branchId: 'b1', qty: 5 }, { variantId: 'b', branchId: 'b1', qty: 0 }, { variantId: 'c', branchId: 'b1', qty: 0 },
+      { variantId: 'd', branchId: 'b1', qty: 1 }, { variantId: 'e', branchId: 'b1', qty: 4 }, { variantId: 'f', branchId: 'b1', qty: -2 },
+      { variantId: 'g', branchId: 'b1', qty: 11 }, { variantId: 'zz', branchId: 'b1', qty: 0 },
+    ];
+    const r = lowStockItems(rows, vs);
+    expect(r.map((x) => x.variantId)).toEqual(['f', 'b', 'a', 'e']);
+    expect(r[0]).toEqual({ variantId: 'f', productId: 'p-F', productName: 'F', label: 'u', category: 'Veladoras', branchId: 'b1', qty: -2, minStock: 0 });
   });
 });

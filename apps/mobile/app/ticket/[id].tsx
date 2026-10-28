@@ -3,19 +3,18 @@
  * (mismo folio, importes y fecha): reimprimir nunca recalcula nada.
  */
 import React, { useCallback, useEffect, useState } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
-import { useLocalSearchParams } from 'expo-router';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import { formatMxDateTime } from '@amara/shared';
 import type { Sale } from '@amara/shared';
 import type { TicketPayload } from '@amara/database';
 import { Banner, Button, Card, H2, Loading, Muted, Row, Screen } from '../../src/components/ui';
+import { HtmlPreview } from '../../src/components/HtmlPreview';
 import { useApp } from '../../src/state/AppContext';
-import { ticketLines } from '../../src/lib/ticket-render';
+import { ticketCopiesHtml } from '../../src/lib/ticket-render';
 import { clientFromLink, loadLink } from '../../src/services/lan';
 import type { LanLink } from '../../src/services/lan';
 import { printViaPc, printWithSystem, sharePdf } from '../../src/services/printing';
 import type { PrintOutcome } from '../../src/services/printing';
-import { colors, radius, space } from '../../src/theme';
 
 interface Loaded {
   payload: TicketPayload;
@@ -27,6 +26,7 @@ interface Loaded {
 
 export default function TicketScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
+  const router = useRouter();
   const app = useApp();
   const { store, session } = app;
   const [data, setData] = useState<Loaded | null>(null);
@@ -60,7 +60,6 @@ export default function TicketScreen() {
   if (!allowed) return <Screen><Banner kind="error" text="No tienes permiso para ver este ticket." /></Screen>;
 
   const reprint = data.printCount > 0;
-  const lines = ticketLines(data.payload);
 
   async function run(kind: 'system' | 'pc' | 'pdf') {
     if (!store || !data) return;
@@ -79,13 +78,8 @@ export default function TicketScreen() {
   return (
     <Screen>
       <Card>
-        <View style={styles.paper}>
-          {lines.map((l, i) => (
-            <Text key={i} style={[styles.line, l.strong && styles.strong]}>
-              {l.text}
-            </Text>
-          ))}
-        </View>
+        <HtmlPreview html={ticketCopiesHtml(data.payload, { reprint })} height={400} />
+        <Muted>Vista previa: copia del cliente y copia de la tienda (es lo mismo que se imprime).</Muted>
       </Card>
 
       <Card>
@@ -99,18 +93,23 @@ export default function TicketScreen() {
 
         <Button title="Pedir a la PC que imprima las 2 copias" onPress={() => void run('pc')} loading={busy === 'pc'} disabled={!link || busy !== null} />
         {!link ? <Muted>Para usar la impresora de la PC, vincula este teléfono en Más - Vincular con la PC.</Muted> : null}
-        <Button title="Imprimir con el teléfono" variant="secondary" onPress={() => void run('system')} loading={busy === 'system'} disabled={busy !== null} />
+        <Button title="Imprimir con el teléfono (cliente y tienda)" variant="secondary" onPress={() => void run('system')} loading={busy === 'system'} disabled={busy !== null} />
         <Button title="Guardar o compartir PDF (2 copias)" variant="secondary" onPress={() => void run('pdf')} loading={busy === 'pdf'} disabled={busy !== null} />
         <Muted>
           "Imprimir con el teléfono" usa el servicio de impresión de Android: sirve con impresoras de red compatibles; las térmicas Bluetooth normalmente no aparecen. Si no hay impresora, no pasa nada: el ticket queda guardado con su folio y se reimprime después.
         </Muted>
       </Card>
+
+      {data.sale.status !== 'cancelada' ? (
+        <Card>
+          <H2>Devolución o cancelación</H2>
+          <Muted>Pide autorización: el gerente confirma con su contraseña; el vendedor necesita la de un administrador o un token.</Muted>
+          <Button title="Devolver productos" variant="secondary" onPress={() => router.push({ pathname: '/adjust', params: { saleId: data.saleId, type: 'devolucion' } })} />
+          <Button title="Cancelar ticket completo" variant="danger" onPress={() => router.push({ pathname: '/adjust', params: { saleId: data.saleId, type: 'cancelacion' } })} />
+        </Card>
+      ) : null}
     </Screen>
   );
 }
 
-const styles = StyleSheet.create({
-  paper: { backgroundColor: colors.white, padding: space.sm, borderRadius: radius.sm, gap: 2 },
-  line: { fontFamily: 'monospace', fontSize: 13, color: colors.text },
-  strong: { fontWeight: '800' },
-});
+

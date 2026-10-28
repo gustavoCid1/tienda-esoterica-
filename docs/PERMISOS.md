@@ -29,13 +29,13 @@
 | `ventas.descuento` | Sí | — | — | Aplicar descuentos |
 | `ventas.ver_propias` | Sí | Sí | — | Ver sus propias ventas (sin acumulados financieros) |
 | `ventas.ver_todas` | Sí | — | — | Ver las ventas de todos |
-| `ventas.cancelar` | Sí | — | — | Cancelar una venta (con motivo; reautenticación en la API) |
-| `ventas.devolver` | Sí | — | — | Registrar devoluciones (con motivo; reautenticación en la API) |
+| `ventas.cancelar` | Sí | — | — | Cancelar una venta (con motivo; reautenticación en la API). **v2:** el vendedor puede hacerlo SOLO con autorización (sección 4b) |
+| `ventas.devolver` | Sí | — | — | Registrar devoluciones (con motivo; reautenticación en la API). **v2:** el vendedor puede hacerlo SOLO con autorización (sección 4b) |
 | `tickets.imprimir_propios` | Sí | Sí | — | Imprimir/reimprimir los tickets de sus propias ventas |
 | `tickets.archivo` | Sí | — | — | Archivo de tickets completo |
 | `caja.abrir` | Sí | — | — | Abrir la caja |
 | `caja.movimientos` | Sí | — | — | Entradas, retiros y gastos de efectivo |
-| `caja.corte` | Sí | — | — | Corte de caja e historial de cortes |
+| `caja.corte` | Sí | — | — | Corte de caja e historial de cortes. **v2:** el vendedor puede cerrar la caja SOLO con autorización (sección 4b); el historial de cortes sigue siendo del gerente |
 | `estadisticas.ver` | Sí | — | — | Dashboard, "Resumen de ventas de hoy", informes |
 | `usuarios.gestionar` | Sí | — | — | Crear y editar usuarios |
 | `sucursales.gestionar` | Sí | — | — | Sucursales, ubicaciones y terminales |
@@ -43,7 +43,7 @@
 | `sync.conflictos` | Sí | — | — | Ver y resolver conflictos; recalcular existencias |
 | `respaldos.ver` | Sí | — | Sí | Ver el registro de respaldos |
 | `auditoria.ver` | Sí | — | — | Ver el historial de auditoría |
-| `config.editar` | Sí | — | — | Cambiar configuraciones permitidas |
+| `config.editar` | Sí | — | — | Cambiar configuraciones permitidas. **v2:** crear/ver/revocar **tokens de seguridad** (`/security/tokens`) y editar las categorías que admiten "Extra" (`PUT /settings/extra-categories`) |
 | `sistema.diagnostico` | — | — | Sí | Diagnóstico técnico (versión, conexión a la base, latencia). **Sin datos financieros** |
 | `sync.estado` | Sí | — | Sí | Estado de sincronización (terminales, pendientes) |
 
@@ -86,7 +86,27 @@ La escritura de datos en el almacén local (`registerMovement`) aplica la regla 
 
 ## 4. Reautenticación
 
-Acciones que, además del permiso, exigen la contraseña de nuevo (token `x-reauth` válido 5 minutos): cancelar y devolver ventas, cerrar caja, cambiar precios, crear usuarios o cambiar rol/contraseña (ver [API.md](API.md)).
+Acciones que, además del permiso, exigen la contraseña de nuevo (token `x-reauth` válido 5 minutos): cancelar y devolver ventas, cerrar caja, cambiar precios, crear usuarios o cambiar rol/contraseña, y (v2) crear tokens de seguridad (ver [API.md](API.md)).
+
+## 4b. Autorización de acciones sensibles (v2)
+
+Los permisos de la matriz **no cambian** (no se agregó ninguno). Lo nuevo es que el vendedor puede *ejecutar* tres acciones que normalmente son del gerente, pero solo si un administrador lo autoriza **en ese momento**:
+
+| Acción | Propósito de la autorización | Gerente | Vendedor | Desarrollador |
+|---|---|---|---|---|
+| Cerrar caja | `cierre_caja` | Directo (su contraseña, `x-reauth`) | Con contraseña de un gerente **o** token | Nunca |
+| Cancelar una venta | `cancelacion` | Directo | Con contraseña de un gerente **o** token | Nunca |
+| Devolver mercancía | `devolucion` | Directo | Con contraseña de un gerente **o** token | Nunca |
+| Hacer una **Limpia** (venta `type:'limpia'`) | `limpias` | Directo | Con contraseña de un gerente **o** token | Nunca |
+
+- **Contraseña de administrador:** la de un gerente **activo** de esa sucursal. La contraseña solo viaja a `POST /security/verify` (o se compara contra el verificador descargado si no hay internet); nunca se guarda en la operación, solo el id del gerente.
+- **Token:** código de 6 a 10 caracteres que crea el gerente (`POST /security/tokens`, con `x-reauth`) con propósitos, vigencia (1 min a 7 días), sucursal, usuario destino y máximo de usos opcionales. El código se muestra **una sola vez**; la base solo guarda sal + hash. El gerente puede revocarlo cuando quiera.
+- **Quién queda registrado:** siempre `authorizedBy` (el gerente que autorizó; con token, quien lo creó). Un gerente que hace la acción él mismo queda como su propio autorizador.
+- **Sin conexión:** el punto de venta valida contra los tokens y verificadores descargados en el último `pull`. Si no puede comprobar la autorización, **deniega**.
+- **Al sincronizar:** el servidor revisa la autorización con la **hora local de la operación** (nunca una hora futura). Si no era válida (token vencido o revocado en ese momento, otro propósito, otra sucursal, gerente inactivo, sin usos), la operación **ya ocurrida se conserva** y se abre el conflicto `autorizacion_invalida` para el gerente. Una operación del vendedor **sin** autorización se rechaza (`sin_permiso`).
+- **Límite de intentos:** `POST /security/verify` admite 5 fallos por minuto por usuario o terminal (después, HTTP 429).
+- **Sigue prohibido para vendedor y desarrollador:** `/stats/*`, `/security/tokens*`, `/settings/extra-categories` (PUT), `GET /sales/today-summary`, `GET /admin/audit` y los reportes. El vendedor solo **lee** `GET /settings/extra-categories` (para saber qué productos admiten "Extra").
+- **Existencias:** ninguna venta nueva puede dejar la existencia en negativo (`sin_existencia`). Única excepción: una venta que ya ocurrió sin conexión y se sincroniza después se aplica y deja el conflicto `stock_negativo`.
 
 ## 5. Qué ve cada rol (resumen para la dueña)
 
@@ -94,8 +114,9 @@ Acciones que, además del permiso, exigen la contraseña de nuevo (token `x-reau
 |---|---|
 | Venda en el mostrador | Vendedor |
 | Cobre, escanee, imprima tickets | Vendedor |
-| Abra la caja y haga el corte | **Solo gerente** |
-| Cancele ventas, haga devoluciones, aplique descuentos | **Solo gerente** |
+| Abra la caja y haga el corte | **Solo gerente** (el vendedor cierra únicamente con contraseña de admin o un token que tú le des) |
+| Cancele ventas, haga devoluciones | **Gerente**; el vendedor solo con contraseña de admin o token |
+| Aplique descuentos | **Solo gerente** |
 | Cambie precios o dé de alta productos | **Solo gerente** |
 | Vea cuánto se vendió hoy en el celular | **Solo gerente** |
 | Revise problemas técnicos sin ver dinero | Desarrollador |
@@ -108,4 +129,5 @@ Hay pruebas escritas (todas **sin ejecutar** aún):
 - `packages/shared/test/cash-reports.test.ts` → "permisos por rol: vendedor sin finanzas, desarrollador sin finanzas" y "permiso temporal: vigencia, sucursal, función y revocación".
 - `packages/database/test/local-store.test.ts` → "permisos: vendedor no cancela ni da descuentos; desarrollador no vende" y "permiso temporal…".
 - `apps/mobile/test/lib-misc.test.ts` → casos de `entry-guard`.
-- Pruebas de endpoints de la API (escenario 10 y 22): **todavía no existen**; procedimiento manual en [PRUEBAS.md](PRUEBAS.md).
+- Pruebas de endpoints de la API (escenario 10 y 22): `apps/api/test/route-permissions.test.ts` (supertest, **no ejecutadas** en este entorno: faltan dependencias) cubre estadísticas, tokens, configuración de extras, resumen de hoy y las acciones con autorización; procedimiento manual en [PRUEBAS.md](PRUEBAS.md).
+- **v2:** `packages/shared/test/tokens.test.ts`, `packages/database/test/v2.test.ts`, `apps/api/test/sync-apply-v2.test.ts` y `apps/api/test/security.test.ts` cubren tokens y autorizaciones.

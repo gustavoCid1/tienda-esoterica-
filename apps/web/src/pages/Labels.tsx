@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { api, asList } from '../lib/api.ts';
 import { errorMessage } from '../lib/hooks.ts';
@@ -13,6 +13,9 @@ import type { InventoryRow } from '../lib/types.ts';
 import { Alert, Badge, Card, Empty, PageHeader, TableWrap } from '../components/ui.tsx';
 import { VariantPicker } from '../components/common.tsx';
 import { LabelCard } from '../components/LabelCard.tsx';
+import { PdfPreviewModal } from '../components/PdfPreviewModal.tsx';
+import { buildLabelsPdf, labelsFileName } from '../lib/labelPdf.ts';
+import { loadPdfDeps } from '../lib/pdf.ts';
 import { useToast } from '../context.tsx';
 
 const HISTORY_KEY = 'amara.web.labels.history';
@@ -34,6 +37,9 @@ export function Labels() {
   const [history, setHistory] = useState<HistoryEntry[]>(() => readLocal<HistoryEntry[]>(HISTORY_KEY, []));
   const [dupReport, setDupReport] = useState<string[] | null>(null);
   const [checking, setChecking] = useState(false);
+  const [generating, setGenerating] = useState(false);
+  const [preview, setPreview] = useState<{ blob: Blob; filename: string; pageCount: number; labelCount: number } | null>(null);
+  const recorded = useRef(false);
 
   // Llegada desde Inventario o Catálogo con filas preseleccionadas.
   useEffect(() => {
@@ -58,13 +64,30 @@ export function Labels() {
     if (src) setBatch((b) => addToBatch(b, src, 1));
   };
 
-  const print = () => {
+  // Registro de reimpresión: se guarda cuando el PDF realmente se manda a imprimir o se guarda.
+  const recordHistory = () => {
+    if (recorded.current) return;
+    recorded.current = true;
     const entry: HistoryEntry = { at: new Date().toISOString(), items: batch };
     const next = [entry, ...history].slice(0, 15);
     setHistory(next);
     writeLocal(HISTORY_KEY, next);
-    // Deja que React pinte antes de abrir el diálogo de impresión.
-    setTimeout(() => window.print(), 50);
+  };
+
+  // "Imprimir" ya no abre el diálogo de impresión de la página: genera un PDF real con la hoja de
+  // etiquetas y lo muestra en una vista previa con sus propios botones Imprimir y Guardar PDF.
+  const openPreview = async () => {
+    setGenerating(true);
+    try {
+      const deps = await loadPdfDeps();
+      const res = await buildLabelsPdf(specs, size, roll, deps);
+      recorded.current = false;
+      setPreview({ blob: res.doc.output('blob'), filename: labelsFileName(new Date().toISOString()), pageCount: res.pageCount, labelCount: res.labelCount });
+    } catch (e) {
+      notify(`No se pudo generar el PDF: ${errorMessage(e)}`, 'error');
+    } finally {
+      setGenerating(false);
+    }
   };
 
   // Compara el lote contra TODO el inventario: ¿algún código lo usa otra variante?
@@ -150,8 +173,8 @@ export function Labels() {
         title="3. Vista previa e impresión"
         className="no-print-head"
         actions={
-          <button type="button" className="btn btn-primary" disabled={!printable} onClick={print}>
-            Imprimir etiquetas
+          <button type="button" className="btn btn-primary" disabled={!printable || generating} onClick={openPreview}>
+            {generating ? 'Generando PDF...' : 'Imprimir etiquetas'}
           </button>
         }
       >
@@ -168,11 +191,25 @@ export function Labels() {
           <Empty>Agrega productos al lote para ver las etiquetas.</Empty>
         ) : (
           <div className={`print-area label-sheet ${roll ? 'roll' : ''}`}>
-            {roll && <style>{`@media print { @page { size: ${size.widthMm}mm ${size.heightMm}mm; margin: 0; } }`}</style>}
             {specs.map((s) => <LabelCard key={s.key} spec={s} size={size} />)}
           </div>
         )}
       </Card>
+
+      {preview && (
+        <PdfPreviewModal
+          title="Vista previa de etiquetas"
+          blob={preview.blob}
+          filename={preview.filename}
+          onClose={() => setPreview(null)}
+          onOutput={recordHistory}
+          note={
+            <p className="muted small">
+              {preview.labelCount} etiqueta(s) de {size.label} en {preview.pageCount} página(s) {roll ? '(una etiqueta por página, rollo)' : '(hoja carta)'}. Esto es lo que se imprimirá: revisa antes de mandarlo.
+            </p>
+          }
+        />
+      )}
 
       <Card title="Reimpresión (lotes impresos desde este navegador)" className="no-print">
         {history.length === 0 ? (

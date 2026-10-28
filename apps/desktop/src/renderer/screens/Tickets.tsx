@@ -6,10 +6,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { can, mxTodayKey, newId } from '@amara/shared';
 import type { PaymentMethod } from '@amara/shared';
-import type { PrintResult, SaleDetail, SaleRow } from '../../shared/ipc.ts';
+import type { SaleDetail, SaleRow, SensitiveAuth } from '../../shared/ipc.ts';
+import { AuthPrompt } from '../components/AuthPrompt.tsx';
+import { DocPreviewModal } from '../components/DocPreviewModal.tsx';
 import { Banner, Field } from '../components/Field.tsx';
 import { Modal } from '../components/Modal.tsx';
-import { call, errorText } from '../lib/api.ts';
+import { call, errorCode, errorText } from '../lib/api.ts';
 import { METHOD_LABEL, dateTime, money } from '../lib/format.ts';
 import { useApp } from '../state/AppState.tsx';
 import { useFeedback } from '../state/Feedback.tsx';
@@ -82,7 +84,7 @@ export function TicketsScreen() {
         <tbody>
           {rows.map((r) => (
             <tr key={r.id} className={r.status === 'cancelada' ? 'row-cancel' : ''}>
-              <td className="mono">{r.folio}</td>
+              <td className="mono">{r.folio}{r.type === 'limpia' && <span className="chip chip-violet">Limpia</span>}</td>
               <td>{dateTime(r.createdAt)}</td>
               <td>{r.userName}</td>
               <td className="num strong">{money(r.totalCents)}</td>
@@ -111,8 +113,7 @@ function TicketDetailModal({ id, onClose, onChanged }: { id: string; onClose: ()
   const { toast } = useFeedback();
   const [d, setD] = useState<SaleDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [printing, setPrinting] = useState(false);
-  const [printRes, setPrintRes] = useState<PrintResult | null>(null);
+  const [preview, setPreview] = useState(false);
   const [sub, setSub] = useState<'refund' | 'cancel' | null>(null);
 
   const reload = useCallback(async () => {
@@ -126,34 +127,24 @@ function TicketDetailModal({ id, onClose, onChanged }: { id: string; onClose: ()
     void reload();
   }, [reload]);
 
-  const reprint = async () => {
-    if (printing) return;
-    setPrinting(true);
-    setPrintRes(null);
-    try {
-      const r = await call('print:ticket', { saleId: id, reprint: true });
-      setPrintRes(r);
-      if (r.ok) toast('ok', 'Ticket reimpreso (copia cliente y copia tienda).');
-      void reload();
-    } catch (e) {
-      setPrintRes({ ok: false, printedCopies: [], error: errorText(e) });
-    } finally {
-      setPrinting(false);
-    }
-  };
-
   const sale = d?.sale;
-  const canAdjust = !!user && can(user.role, 'ventas.cancelar') && sale?.status === 'completada';
+  // Gerente: confirma su contraseña. Vendedor (solo sus ventas): contraseña de administrador o token de devolución/cancelación.
+  const canAdjust = !!user && sale?.status === 'completada' && (can(user.role, 'ventas.cancelar') || (user.role === 'vendedor' && sale.userId === user.id));
+  const manager = !!user && can(user.role, 'tickets.archivo');
   const returnedAll = !!d && !!sale && sale.items.every((i) => (d.returned[i.id] ?? 0) >= i.qty);
 
   return (
-    <Modal title={sale ? `Ticket ${sale.folio}` : 'Ticket'} size="lg" onClose={onClose} busy={printing} footer={<button className="btn" onClick={onClose}>Cerrar</button>}>
+    <Modal title={sale ? `Ticket ${sale.folio}` : 'Ticket'} size="lg" onClose={onClose} footer={<button className="btn" onClick={onClose}>Cerrar</button>}>
       {error && <Banner kind="error">{error}</Banner>}
       {sale && d && (
         <div className="stack">
           <div className="row-between">
             <div>
-              <div className="muted">{dateTime(sale.createdAt)} - Atendió {sale.userName}</div>
+              <div className="muted">
+                {dateTime(sale.createdAt)} - Atendió {sale.userName}
+                {manager && sale.sellerName ? ` - Vendió ${sale.sellerName}` : ''}
+                {sale.type === 'limpia' && <span className="chip chip-violet">Limpia</span>}
+              </div>
               {sale.status === 'cancelada' && <div className="neg strong">VENTA CANCELADA</div>}
             </div>
             <div className="strong big">{money(sale.totalCents)}</div>
@@ -163,7 +154,9 @@ function TicketDetailModal({ id, onClose, onChanged }: { id: string; onClose: ()
             <tbody>
               {sale.items.map((i) => (
                 <tr key={i.id}>
-                  <td>{i.productName} <span className="muted">{i.variantLabel}</span></td>
+                  <td>
+                    {i.kind === 'extra' ? <><span className="chip chip-info">Extra</span> {i.extraNote} <span className="muted">sobre {i.productName} {i.variantLabel}</span></> : <>{i.productName} <span className="muted">{i.variantLabel}</span></>}
+                  </td>
                   <td className="num">{i.qty}</td>
                   <td className="num">{money(i.unitPriceCents)}</td>
                   <td className="num">{money(i.netCents)}</td>
@@ -198,14 +191,14 @@ function TicketDetailModal({ id, onClose, onChanged }: { id: string; onClose: ()
           )}
           <div className="muted small">Impresiones registradas: {d.printCount}</div>
           {d.lastPrintError && <Banner kind="warn">Último error de impresión: {d.lastPrintError}</Banner>}
-          {printRes && !printRes.ok && <Banner kind="error">{printRes.error}</Banner>}
           <div className="row-gap">
-            <button className="btn btn-gold" onClick={() => void reprint()} disabled={printing}>{printing ? 'Imprimiendo...' : 'Reimprimir ticket'}</button>
+            <button className="btn btn-gold" onClick={() => setPreview(true)}>Ver ticket / Imprimir</button>
             {canAdjust && !returnedAll && <button className="btn" onClick={() => setSub('refund')}>Devolución</button>}
             {canAdjust && <button className="btn btn-danger" onClick={() => setSub('cancel')}>Cancelar venta</button>}
           </div>
         </div>
       )}
+      {preview && <DocPreviewModal doc={{ kind: 'ticket', saleId: id }} title={sale ? `Ticket ${sale.folio}` : 'Ticket'} onPrinted={() => void reload()} onClose={() => setPreview(false)} />}
       {sub === 'refund' && d && <RefundModal detail={d} onClose={() => setSub(null)} onDone={() => { setSub(null); void reload(); onChanged(); }} />}
       {sub === 'cancel' && d && <CancelModal detail={d} onClose={() => setSub(null)} onDone={() => { setSub(null); void reload(); onChanged(); }} />}
     </Modal>
@@ -221,7 +214,8 @@ function RefundModal({ detail, onClose, onDone }: { detail: SaleDetail; onClose:
   const [restock, setRestock] = useState<Record<string, boolean>>({});
   const [reason, setReason] = useState('');
   const [method, setMethod] = useState<PaymentMethod>(sale.payments.some((p) => p.method === 'efectivo') ? 'efectivo' : sale.payments[0]!.method);
-  const [password, setPassword] = useState('');
+  const [auth, setAuth] = useState<SensitiveAuth | null>(null);
+  const [resetSignal, setResetSignal] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -232,8 +226,8 @@ function RefundModal({ detail, onClose, onDone }: { detail: SaleDetail; onClose:
     const q = Number(qty[i.id] ?? 0);
     return !Number.isInteger(q) || q < 0 || q > i.qty - (returned[i.id] ?? 0);
   });
-  const dirty = Object.values(qty).some((v) => v !== '' && v !== '0') || reason !== '' || password !== '';
-  const ready = lines.length > 0 && !bad && reason.trim().length >= 3 && password.length > 0;
+  const dirty = Object.values(qty).some((v) => v !== '' && v !== '0') || reason !== '' || auth !== null;
+  const ready = lines.length > 0 && !bad && reason.trim().length >= 3 && auth !== null;
 
   const submit = async () => {
     if (submitting.current || !ready) return;
@@ -241,12 +235,12 @@ function RefundModal({ detail, onClose, onDone }: { detail: SaleDetail; onClose:
     setBusy(true);
     setError(null);
     try {
-      await call('sales:refund', { saleId: sale.id, reason: reason.trim(), password, adjustmentId: adjId.current, method, lines: lines.map((l) => ({ saleItemId: l.id, qty: l.q, restock: l.restock })) });
+      await call('sales:refund', { saleId: sale.id, reason: reason.trim(), ...auth, adjustmentId: adjId.current, method, lines: lines.map((l) => ({ saleItemId: l.id, qty: l.q, restock: l.restock })) });
       toast('ok', 'Devolución registrada.');
       onDone();
     } catch (e) {
       setError(errorText(e));
-      setPassword('');
+      if (['credenciales', 'autorizacion_requerida', 'autorizacion_invalida'].includes(errorCode(e))) setResetSignal((n) => n + 1);
       submitting.current = false;
       setBusy(false);
     }
@@ -274,11 +268,15 @@ function RefundModal({ detail, onClose, onDone }: { detail: SaleDetail; onClose:
               const max = i.qty - (returned[i.id] ?? 0);
               return (
                 <tr key={i.id}>
-                  <td>{i.productName} <span className="muted">{i.variantLabel}</span></td>
+                  <td>{i.kind === 'extra' ? <><span className="chip chip-info">Extra</span> {i.extraNote}</> : <>{i.productName} <span className="muted">{i.variantLabel}</span></>}</td>
                   <td className="num">{max}</td>
                   <td className="num"><input className="inp inp-qty" inputMode="numeric" disabled={max === 0} value={qty[i.id] ?? ''} placeholder="0" onChange={(e) => setQty({ ...qty, [i.id]: e.target.value })} /></td>
                   <td>
-                    <label className="check"><input type="checkbox" checked={restock[i.id] !== false} onChange={(e) => setRestock({ ...restock, [i.id]: e.target.checked })} /> Sí (desmarca si está dañado)</label>
+                    {i.kind === 'extra' ? (
+                      <span className="muted small">No aplica (es un cargo, no una pieza)</span>
+                    ) : (
+                      <label className="check"><input type="checkbox" checked={restock[i.id] !== false} onChange={(e) => setRestock({ ...restock, [i.id]: e.target.checked })} /> Sí (desmarca si está dañado)</label>
+                    )}
                   </td>
                 </tr>
               );
@@ -293,7 +291,7 @@ function RefundModal({ detail, onClose, onDone }: { detail: SaleDetail; onClose:
           </Field>
           <Field label="Motivo" hint="Mínimo 3 letras"><input className="inp" value={reason} onChange={(e) => setReason(e.target.value)} /></Field>
         </div>
-        <Field label="Tu contraseña (confirmación)"><input className="inp" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" /></Field>
+        <AuthPrompt purpose="devolucion" onChange={setAuth} resetSignal={resetSignal} disabled={busy} />
         {bad && <Banner kind="warn">Revisa las cantidades: no pueden exceder lo que falta por devolver.</Banner>}
         {error && <Banner kind="error">{error}</Banner>}
       </div>
@@ -306,11 +304,12 @@ function CancelModal({ detail, onClose, onDone }: { detail: SaleDetail; onClose:
   const adjId = useRef(newId());
   const submitting = useRef(false);
   const [reason, setReason] = useState('');
-  const [password, setPassword] = useState('');
+  const [auth, setAuth] = useState<SensitiveAuth | null>(null);
+  const [resetSignal, setResetSignal] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const hasReturns = Object.keys(detail.returned).length > 0;
-  const ready = reason.trim().length >= 3 && password.length > 0 && !hasReturns;
+  const ready = reason.trim().length >= 3 && auth !== null && !hasReturns;
 
   const submit = async () => {
     if (submitting.current || !ready) return;
@@ -318,12 +317,12 @@ function CancelModal({ detail, onClose, onDone }: { detail: SaleDetail; onClose:
     setBusy(true);
     setError(null);
     try {
-      await call('sales:cancel', { saleId: detail.sale.id, reason: reason.trim(), password, adjustmentId: adjId.current });
+      await call('sales:cancel', { saleId: detail.sale.id, reason: reason.trim(), ...auth, adjustmentId: adjId.current });
       toast('ok', 'Venta cancelada. La existencia regresó al inventario.');
       onDone();
     } catch (e) {
       setError(errorText(e));
-      setPassword('');
+      if (['credenciales', 'autorizacion_requerida', 'autorizacion_invalida'].includes(errorCode(e))) setResetSignal((n) => n + 1);
       submitting.current = false;
       setBusy(false);
     }
@@ -334,7 +333,7 @@ function CancelModal({ detail, onClose, onDone }: { detail: SaleDetail; onClose:
       title="Cancelar venta"
       size="md"
       onClose={onClose}
-      dirty={reason !== '' || password !== ''}
+      dirty={reason !== '' || auth !== null}
       busy={busy}
       footer={
         <>
@@ -349,7 +348,7 @@ function CancelModal({ detail, onClose, onDone }: { detail: SaleDetail; onClose:
         </Banner>
         {hasReturns && <Banner kind="error">Esta venta ya tiene devoluciones. Registra devoluciones por el resto de las piezas.</Banner>}
         <Field label="Motivo de la cancelación" hint="Mínimo 3 letras"><input className="inp" value={reason} onChange={(e) => setReason(e.target.value)} autoFocus /></Field>
-        <Field label="Tu contraseña (confirmación)"><input className="inp" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" /></Field>
+        <AuthPrompt purpose="cancelacion" onChange={setAuth} resetSignal={resetSignal} disabled={busy} />
         {error && <Banner kind="error">{error}</Banner>}
       </div>
     </Modal>

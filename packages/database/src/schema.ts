@@ -217,6 +217,71 @@ CREATE TRIGGER audit_no_delete BEFORE DELETE ON audit_log BEGIN SELECT RAISE(ABO
 CREATE TRIGGER audit_no_update BEFORE UPDATE ON audit_log BEGIN SELECT RAISE(ABORT, 'La auditoría no se modifica'); END;
 `;
 
-export const MIGRATIONS: Migration[] = [{ version: 1, name: 'esquema_inicial', sql: V1 }];
+/**
+ * Versión 2 (ADITIVA). Nunca se edita V1: las tiendas ya tienen datos reales.
+ * Todo lo nuevo es opcional o tiene valor por defecto, así que las ventas, tickets, cortes y
+ * movimientos existentes quedan intactos y siguen siendo válidos.
+ *  - sales: quién vendió (seller_id/seller_name, solo en sistema) y tipo de venta ('venta' | 'limpia').
+ *  - sale_items: línea 'extra' (cargo adicional sin movimiento de inventario) y su nota.
+ *  - cash_sessions: quién autorizó el cierre (JSON ActionAuthorization). closed_by/closed_at/counted_cents/
+ *    expected_cents/difference_cents ya existían desde V1.
+ *  - sale_adjustments: quién autorizó una cancelación/devolución hecha por un vendedor.
+ *  - security_tokens_cache: hashes de tokens descargados en el pull (NUNCA el código) para validar sin internet.
+ *  - app_settings: configuración descargada del servidor (p. ej. extraCategories).
+ */
+const V2 = `
+ALTER TABLE sales ADD COLUMN seller_id TEXT;
+ALTER TABLE sales ADD COLUMN seller_name TEXT;
+ALTER TABLE sales ADD COLUMN sale_type TEXT NOT NULL DEFAULT 'venta' CHECK (sale_type IN ('venta','limpia'));
+ALTER TABLE sales ADD COLUMN authorization_json TEXT;
+CREATE INDEX idx_sales_type_created ON sales(sale_type, created_at);
+
+ALTER TABLE sale_items ADD COLUMN kind TEXT NOT NULL DEFAULT 'producto' CHECK (kind IN ('producto','extra'));
+ALTER TABLE sale_items ADD COLUMN extra_note TEXT;
+
+ALTER TABLE cash_sessions ADD COLUMN close_authorization_json TEXT;
+ALTER TABLE cash_sessions ADD COLUMN close_authorized_by TEXT;
+
+ALTER TABLE sale_adjustments ADD COLUMN authorization_json TEXT;
+ALTER TABLE sale_adjustments ADD COLUMN authorized_by TEXT;
+
+CREATE TABLE security_tokens_cache (
+  id TEXT PRIMARY KEY,
+  label TEXT NOT NULL DEFAULT '',
+  hash TEXT NOT NULL,
+  salt TEXT NOT NULL,
+  purposes TEXT NOT NULL DEFAULT '[]',     -- JSON: TokenPurpose[]
+  branch_id TEXT,                           -- NULL = cualquier sucursal
+  for_user_id TEXT,
+  created_by TEXT,
+  created_at TEXT,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT,
+  max_uses INTEGER,                         -- NULL = ilimitado
+  used_count INTEGER NOT NULL DEFAULT 0,
+  fetched_at TEXT
+);
+CREATE INDEX idx_tokens_cache_expires ON security_tokens_cache(expires_at);
+
+CREATE TABLE app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,                      -- JSON
+  updated_at TEXT NOT NULL
+);
+
+-- El vendedor, el tipo de venta y la autorización quedan fijos una vez registrada la venta.
+CREATE TRIGGER sales_v2_immutable BEFORE UPDATE OF seller_id, seller_name, sale_type, authorization_json ON sales
+  BEGIN SELECT RAISE(ABORT, 'Los datos de una venta no se pueden modificar'); END;
+CREATE TRIGGER cash_close_auth_immutable BEFORE UPDATE OF close_authorization_json, close_authorized_by ON cash_sessions
+  WHEN OLD.close_authorization_json IS NOT NULL
+  BEGIN SELECT RAISE(ABORT, 'Un corte cerrado no se modifica'); END;
+CREATE TRIGGER adj_v2_immutable BEFORE UPDATE OF authorization_json, authorized_by ON sale_adjustments
+  BEGIN SELECT RAISE(ABORT, 'Historial protegido'); END;
+`;
+
+export const MIGRATIONS: Migration[] = [
+  { version: 1, name: 'esquema_inicial', sql: V1 },
+  { version: 2, name: 'v2_vendedor_extras_tokens_ajustes', sql: V2 },
+];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;

@@ -15,7 +15,10 @@
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#FFFFFF"
       },
-      "permissions": ["CAMERA"]
+      "permissions": [
+        "CAMERA",
+        "POST_NOTIFICATIONS"
+      ]
     },
     "plugins": [
       "expo-router",
@@ -36,6 +39,7 @@
           "recordAudioAndroid": false
         }
       ],
+      "expo-notifications",
       "expo-secure-store",
       "expo-sqlite",
       [

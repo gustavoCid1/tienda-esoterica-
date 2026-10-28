@@ -76,11 +76,57 @@ test('ventas simultáneas: folios únicos e inventario consistente', async () =>
   assert.equal(await store.stockQty(V_CH, B1), 2);
 });
 
-test('stock negativo no bloquea la venta física pero avisa', async () => {
+test('v2: una venta nueva que supera la existencia se rechaza (nunca queda negativa); el servidor sí acepta lo ya ocurrido', async () => {
   const { store } = await readyStore();
-  const r = await store.registerSale({ saleId: newId(), actor: vendedor, branchId: B1, terminalId: T1, items: [{ variantId: V_GR, qty: 5 }], payments: cash(75000) });
-  assert.equal(r.warnings.length, 1);
-  assert.equal(await store.stockQty(V_GR, B1), -1);
+  // Hay 4 grandes en la sucursal 1: pedir 5 se rechaza sin guardar nada.
+  await assert.rejects(
+    store.registerSale({ saleId: newId(), actor: vendedor, branchId: B1, terminalId: T1, items: [{ variantId: V_GR, qty: 5 }], payments: cash(75000) }),
+    (e: unknown) => e instanceof StoreError && e.code === 'sin_existencia' && e.data?.available === 4 && e.data?.variantId === V_GR,
+  );
+  assert.equal(await store.stockQty(V_GR, B1), 4);
+  assert.equal((await store.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM sales'))?.n, 0);
+  assert.equal((await store.db.get<{ n: number }>("SELECT COUNT(*) AS n FROM sync_queue WHERE type = 'sale.create'"))?.n, 0);
+  // Exactamente lo disponible sí se vende.
+  const ok = await store.registerSale({ saleId: newId(), actor: vendedor, branchId: B1, terminalId: T1, items: [{ variantId: V_GR, qty: 4 }], payments: cash(60000) });
+  assert.deepEqual(ok.warnings, []);
+  assert.equal(await store.stockQty(V_GR, B1), 0);
+  // En 0 ya no se vende ni una pieza.
+  await assert.rejects(
+    store.registerSale({ saleId: newId(), actor: vendedor, branchId: B1, terminalId: T1, items: [{ variantId: V_GR, qty: 1 }], payments: cash(15000) }),
+    (e: unknown) => e instanceof StoreError && e.code === 'sin_existencia' && e.data?.available === 0,
+  );
+});
+
+test('v2: la misma variante repartida en varias líneas se suma contra la existencia', async () => {
+  const { store } = await readyStore();
+  await assert.rejects(
+    store.registerSale({ saleId: newId(), actor: gerente, branchId: B1, terminalId: T1, items: [{ variantId: V_GR, qty: 3 }, { variantId: V_GR, qty: 2 }], payments: cash(75000) }),
+    (e: unknown) => e instanceof StoreError && e.code === 'sin_existencia',
+  );
+});
+
+test('v2: una existencia negativa heredada bloquea la venta y se ve tal cual en el inventario', async () => {
+  const { store } = await readyStore();
+  const p = pullPayload();
+  p.stock = p.stock.map((s) => (s.variantId === V_GR && s.branchId === B1 ? { ...s, qty: -2 } : s));
+  await store.applyPull(p);
+  assert.equal(await store.stockQty(V_GR, B1), -2);
+  await assert.rejects(
+    store.registerSale({ saleId: newId(), actor: vendedor, branchId: B1, terminalId: T1, items: [{ variantId: V_GR, qty: 1 }], payments: cash(15000) }),
+    (e: unknown) => e instanceof StoreError && e.code === 'sin_existencia' && e.data?.available === 0 && e.data?.rawAvailable === -2,
+  );
+});
+
+test('v2: el único caso con existencia negativa es aplicar una venta ya ocurrida (réplica LAN): se aplica tal cual', async () => {
+  const phone = await readyStore();
+  await phone.store.setDeviceInfo({ branchId: B1, branchCode: 'A', terminalId: T1, terminalCode: 'M1' }); // otro código = otros folios
+  const pc = await readyStore();
+  // El teléfono tenía 4 grandes y vendió 4; en la PC otra venta ya dejó solo 1 (la mercancía ya salió físicamente).
+  await pc.store.registerSale({ saleId: newId(), actor: vendedor, branchId: B1, terminalId: T1, items: [{ variantId: V_GR, qty: 3 }], payments: cash(45000) });
+  await phone.store.registerSale({ saleId: newId(), actor: vendedor, branchId: B1, terminalId: T1, items: [{ variantId: V_GR, qty: 4 }], payments: cash(60000) });
+  const op = (await phone.store.nextPending()).find((o) => o.type === 'sale.create')!;
+  assert.equal((await pc.store.ingestRemoteSale(op)).duplicate, false);
+  assert.equal(await pc.store.stockQty(V_GR, B1), -3);
 });
 
 test('caja cerrada bloquea ventas; vendedor no puede abrir caja ni cortar', async () => {
@@ -93,14 +139,17 @@ test('caja cerrada bloquea ventas; vendedor no puede abrir caja ni cortar', asyn
   );
   await assert.rejects(store.openCash({ actor: vendedor, branchId: B1, terminalId: T1, openingCents: 0 }), (e: unknown) => e instanceof StoreError && e.code === 'sin_permiso');
   await store.openCash({ actor: gerente, branchId: B1, terminalId: T1, openingCents: 50000 });
-  await assert.rejects(store.closeCash({ actor: vendedor, terminalId: T1, countedCents: 50000 }), (e: unknown) => e instanceof StoreError && e.code === 'sin_permiso');
+  // v2: el vendedor sin contraseña de admin ni token no puede cortar; el desarrollador nunca.
+  await assert.rejects(store.closeCash({ actor: vendedor, terminalId: T1, countedCents: 50000 }), (e: unknown) => e instanceof StoreError && e.code === 'autorizacion_requerida');
+  await assert.rejects(store.closeCash({ actor: dev, terminalId: T1, countedCents: 50000 }), (e: unknown) => e instanceof StoreError && e.code === 'sin_permiso');
   await assert.rejects(store.openCash({ actor: gerente, branchId: B1, terminalId: T1, openingCents: 1 }), (e: unknown) => e instanceof StoreError && e.code === 'caja_abierta');
 });
 
 test('permisos: vendedor no cancela ni da descuentos; desarrollador no vende', async () => {
   const { store } = await readyStore();
   const s = await store.registerSale({ saleId: newId(), actor: vendedor, branchId: B1, terminalId: T1, items: [{ variantId: V_CH, qty: 1 }], payments: cash(9000) });
-  await assert.rejects(store.cancelSale({ saleId: s.sale.id, actor: vendedor, terminalId: T1, reason: 'error' }), (e: unknown) => e instanceof StoreError && e.code === 'sin_permiso');
+  await assert.rejects(store.cancelSale({ saleId: s.sale.id, actor: vendedor, terminalId: T1, reason: 'error' }), (e: unknown) => e instanceof StoreError && e.code === 'autorizacion_requerida');
+  await assert.rejects(store.cancelSale({ saleId: s.sale.id, actor: dev, terminalId: T1, reason: 'error' }), (e: unknown) => e instanceof StoreError && e.code === 'sin_permiso');
   await assert.rejects(store.registerSale({ saleId: newId(), actor: vendedor, branchId: B1, terminalId: T1, items: [{ variantId: V_CH, qty: 1 }], discountCents: 500, payments: cash(8500) }), (e: unknown) => e instanceof StoreError && e.code === 'sin_permiso');
   await assert.rejects(store.registerSale({ saleId: newId(), actor: dev, branchId: B1, terminalId: T1, items: [{ variantId: V_CH, qty: 1 }], payments: cash(9000) }), (e: unknown) => e instanceof StoreError && e.code === 'sin_permiso');
   const g = await store.registerSale({ saleId: newId(), actor: gerente, branchId: B1, terminalId: T1, items: [{ variantId: V_CH, qty: 1 }], discountCents: 500, payments: cash(8500) });
@@ -191,7 +240,7 @@ test('permiso temporal: vendedor da entrada solo con permiso vigente; expira; no
   assert.equal(row.grant_id, 'g1');
   // El permiso NO sirve para salidas ni cortes
   await assert.rejects(store.registerMovement({ ...mov(newId()), type: 'salida' }), (e: unknown) => e instanceof StoreError && e.code === 'sin_permiso');
-  await assert.rejects(store.closeCash({ actor: vendedor, terminalId: T1, countedCents: 0 }), (e: unknown) => e instanceof StoreError && e.code === 'sin_permiso');
+  await assert.rejects(store.closeCash({ actor: vendedor, terminalId: T1, countedCents: 0 }), (e: unknown) => e instanceof StoreError && e.code === 'autorizacion_requerida');
   // Expira
   clock.advance(31 * 60000);
   await assert.rejects(store.registerMovement(mov(newId())), (e: unknown) => e instanceof StoreError && e.code === 'sin_permiso');
@@ -301,8 +350,8 @@ test('migraciones son idempotentes e integridad ok', async () => {
   const { store } = await readyStore();
   await store.migrate();
   await store.migrate();
-  const v = await store.db.all<any>('SELECT version FROM schema_migrations');
-  assert.equal(v.length, 1);
+  const v = await store.db.all<any>('SELECT version FROM schema_migrations ORDER BY version');
+  assert.deepEqual(v.map((r) => r.version), [1, 2]);
   assert.deepEqual(await store.integrityCheck(), { ok: true, problems: [] });
   void Clock;
 });

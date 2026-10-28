@@ -42,7 +42,7 @@ export function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
 }
 
-const BASE_CSS = (paperMm: 58 | 80) => {
+export const BASE_CSS = (paperMm: 58 | 80) => {
   const w = printableWidthMm(paperMm);
   const fs = paperMm === 58 ? 10.5 : 12;
   const logoMm = paperMm === 58 ? 30 : 40;
@@ -65,25 +65,40 @@ body { font-family: Arial, Helvetica, sans-serif; font-size: ${fs}px; color: #00
 .item { margin-bottom: 1.5mm; }
 .total { font-size: ${fs + 4}px; font-weight: bold; }
 .foot { text-align: center; margin-top: 3mm; }
+.kind { text-align: center; font-weight: bold; letter-spacing: 2px; font-size: ${fs + 2}px; margin: 1mm 0; }
+.extra .n { font-style: italic; }
+.extra .sub { font-size: ${fs - 1.5}px; }
+.pg { break-after: page; page-break-after: always; }
+.pg:last-child { break-after: auto; page-break-after: auto; }
 `;
 };
 
-function page(title: string, paperMm: 58 | 80, body: string): string {
+export function page(title: string, paperMm: 58 | 80, body: string): string {
   return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>${BASE_CSS(paperMm)}</style></head><body><div class="t">${body}</div></body></html>`;
 }
 
-function header(t: { business: string }, o: Pick<TicketRenderOptions, 'logoSrc'>): string {
+export function header(t: { business: string }, o: Pick<TicketRenderOptions, 'logoSrc'>): string {
   const logo = o.logoSrc ? `<img class="logo" src="${escapeHtml(o.logoSrc)}" alt="${escapeHtml(t.business)}">` : '';
   return `${logo}<div class="biz">${escapeHtml(t.business)}</div>`;
 }
 
-export function buildTicketHtml(t: TicketPayload, o: TicketRenderOptions): string {
-  const items = t.items
-    .map((i) => {
-      const name = i.label && i.label !== 'Única' ? `${i.name} - ${i.label}` : i.name;
-      return `<div class="item"><div class="n">${escapeHtml(name)}</div><div class="r"><span>${i.qty} x ${formatMXN(i.unitPriceCents)}</span><span>${formatMXN(i.netCents)}</span></div></div>`;
-    })
-    .join('');
+/** Renglón de una partida. Un "extra" se ve claramente como "Extra: nota" y no cuenta como pieza. */
+function itemHtml(i: TicketPayload['items'][number]): string {
+  if (i.kind === 'extra') {
+    const note = (i.extraNote ?? '').trim() || 'cargo adicional';
+    const parent = i.label && i.label !== 'Única' ? `${i.name} - ${i.label}` : i.name;
+    return `<div class="item extra"><div class="n">Extra: ${escapeHtml(note)}</div><div class="r sub"><span>sobre ${escapeHtml(parent)}</span><span>${formatMXN(i.netCents)}</span></div></div>`;
+  }
+  const name = i.label && i.label !== 'Única' ? `${i.name} - ${i.label}` : i.name;
+  return `<div class="item"><div class="n">${escapeHtml(name)}</div><div class="r"><span>${i.qty} x ${formatMXN(i.unitPriceCents)}</span><span>${formatMXN(i.netCents)}</span></div></div>`;
+}
+
+/**
+ * Cuerpo del ticket (sin <html>). OJO: el vendedor (sellerName) es un dato interno y NO se imprime nunca:
+ * "Atendió" es quien cobró (usuario con sesión), no quien vendió.
+ */
+export function ticketBodyHtml(t: TicketPayload, o: TicketRenderOptions): string {
+  const items = t.items.map(itemHtml).join('');
 
   const pays = t.payments
     .map((p) => {
@@ -96,9 +111,10 @@ export function buildTicketHtml(t: TicketPayload, o: TicketRenderOptions): strin
     })
     .join('');
 
-  const body = [
+  return [
     header(t, o),
     `<div class="c">${escapeHtml(t.branchName)}</div>`,
+    t.saleType === 'limpia' ? '<div class="kind">LIMPIA</div>' : '',
     `<div class="copy">${COPY_LABEL[o.copy]}</div>`,
     o.reprint ? '<div class="reprint">REIMPRESIÓN</div>' : '',
     t.status === 'cancelada' ? '<div class="cancel">VENTA CANCELADA</div>' : '',
@@ -114,8 +130,21 @@ export function buildTicketHtml(t: TicketPayload, o: TicketRenderOptions): strin
     `<div class="foot">${escapeHtml(o.footer ?? 'Gracias por su compra')}</div>`,
     `<div class="foot">${COPY_LABEL[o.copy]} - ${escapeHtml(t.folio)}</div>`,
   ].join('');
+}
 
-  return page(`Ticket ${t.folio} - ${COPY_LABEL[o.copy]}`, o.paperMm, body);
+export function buildTicketHtml(t: TicketPayload, o: TicketRenderOptions): string {
+  return page(`Ticket ${t.folio} - ${COPY_LABEL[o.copy]}`, o.paperMm, ticketBodyHtml(t, o));
+}
+
+/**
+ * Las dos copias (cliente y tienda) en UN solo documento, una por página: es lo que se guarda como PDF.
+ * (Para imprimir se mandan dos trabajos seguidos con buildTicketHtml; el contenido de cada copia es idéntico.)
+ */
+export function buildTicketPairHtml(t: TicketPayload, o: Omit<TicketRenderOptions, 'copy'>): string {
+  const body = (['cliente', 'tienda'] as const)
+    .map((copy) => `<div class="pg"><div class="t">${ticketBodyHtml(t, { ...o, copy })}</div></div>`)
+    .join('');
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>${escapeHtml(`Ticket ${t.folio}`)}</title><style>${BASE_CSS(o.paperMm)}</style></head><body>${body}</body></html>`;
 }
 
 /** Ticket de prueba de impresión (no es una venta ni consume folio). */

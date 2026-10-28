@@ -11,9 +11,13 @@ import {
   resolveWidgets, sumCashSessions, toggleHidden,
 } from '../lib/dashboard.ts';
 import type { CashSessionRow, DashboardExtra, DashboardPrefs, InventoryRow, MonthsResponse } from '../lib/types.ts';
+import type { ChartKind } from '../lib/types-v2.ts';
+import { chartKindStorageKey, resolveChartKind } from '../lib/series.ts';
+import { readLocal, writeLocal } from '../lib/session.ts';
 import { Alert, Badge, Card, Empty, ErrorBox, KpiCard, Modal, PageHeader, Spinner, TableWrap, CloseButton } from '../components/ui.tsx';
 import { BranchSelect, DateRangeBar } from '../components/common.tsx';
-import { useBranches, useToast } from '../context.tsx';
+import { TopSeriesCard } from '../components/TopSeriesCard.tsx';
+import { useAuth, useBranches, useToast } from '../context.tsx';
 
 /* Colores de gráficas: dorado de marca y gris oscuro; contraste suficiente sobre blanco. */
 const GOLD = '#B8860B';
@@ -51,8 +55,17 @@ export function Dashboard() {
 
   // Preferencias por usuario guardadas en el servidor. No otorgan permisos: solo orden y visibilidad.
   const prefsRes = useAsync((s) => api.get<unknown>('/prefs/dashboard', undefined, s), []);
+  // Tipo de gráfica de la serie de productos: guardado por usuario en las mismas preferencias (y
+  // respaldado en este navegador por si el servidor no responde).
+  const { user } = useAuth();
+  const localKey = chartKindStorageKey(user?.id);
+  const [chartKind, setChartKind] = useState<ChartKind>(() => resolveChartKind(null, readLocal<string | null>(localKey, null)));
   useEffect(() => {
-    if (prefsRes.data) setPrefs(normalizePrefs(prefsRes.data));
+    if (!prefsRes.data) return;
+    const p = normalizePrefs(prefsRes.data);
+    setPrefs(p);
+    setChartKind(resolveChartKind(p.chartKind, readLocal<string | null>(localKey, null)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prefsRes.data]);
 
   const validRange = range.from !== '' && range.to !== '' && range.from <= range.to;
@@ -103,12 +116,28 @@ export function Dashboard() {
 
   const savePrefs = async (next: DashboardPrefs) => {
     try {
-      await api.put('/prefs/dashboard', next);
-      setPrefs(next);
+      // Se conserva el tipo de gráfica elegido: guardar el orden no debe borrarlo.
+      const merged: DashboardPrefs = { ...next, chartKind };
+      await api.put('/prefs/dashboard', merged);
+      setPrefs(merged);
       setEditing(false);
       notify('Tablero guardado.');
     } catch (e) {
       notify(errorMessage(e), 'error');
+    }
+  };
+
+  const changeChartKind = async (kind: ChartKind) => {
+    setChartKind(kind);
+    writeLocal(localKey, kind);
+    // Mientras se leen las preferencias no se escribe: se pisaría el orden guardado con el de fábrica.
+    if (prefsRes.loading) return;
+    const next: DashboardPrefs = { ...prefs, chartKind: kind };
+    setPrefs(next);
+    try {
+      await api.put('/prefs/dashboard', next);
+    } catch (e) {
+      notify(`No se pudo guardar tu tipo de gráfica en el servidor (${errorMessage(e)}). Se recordará en este navegador.`, 'info');
     }
   };
 
@@ -210,6 +239,8 @@ export function Dashboard() {
             )}
           </Card>
         );
+      case 'top_series':
+        return <TopSeriesCard branchId={branchId} range={range} chartKind={chartKind} onChartKind={changeChartKind} />;
       case 'top_units': {
         const data = rankBars(b.period.data?.topByUnits ?? [], 'units');
         return (

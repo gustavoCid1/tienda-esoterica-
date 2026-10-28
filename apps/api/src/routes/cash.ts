@@ -4,9 +4,10 @@ import { z } from 'zod';
 import { computeCashBreakdown, newId, sumDenominations } from '@amara/shared';
 import type { SyncOp } from '@amara/shared';
 import { cashCloseSchema, cents, uuid } from '@amara/shared/schemas';
-import { assertBranch, branchScope, requirePerm, requireReauth } from '../auth.ts';
+import { assertBranch, branchScope, requirePerm } from '../auth.ts';
 import { col } from '../db.ts';
 import { ah, HttpError, out, parse } from '../http.ts';
+import { authorizeOnline, preflight } from '../online-authz.ts';
 import { applySyncOp } from '../sync-apply.ts';
 import type { ApplyContext } from '../sync-apply.ts';
 import { createMongoSyncRepo } from '../sync-repo.ts';
@@ -102,13 +103,15 @@ cashRouter.post(
   }),
 );
 
-/** Corte de caja: solo gerente y con contraseña reciente. El esperado lo calcula el servidor, no el cliente. */
+/**
+ * Corte de caja. Gerente: con contraseña reciente (x-reauth). Vendedor: SOLO con `authorization` (contraseña de admin o token,
+ * verificada antes con POST /security/verify, propósito `cierre_caja`). El esperado lo calcula el servidor, no el cliente.
+ */
 cashRouter.post(
   '/close',
-  requirePerm('caja.corte'),
-  requireReauth,
   ah(async (req, res) => {
     const user = sessionUser(req);
+    await preflight(req, res, 'caja.corte');
     const body = parse(cashCloseSchema.extend({ sessionId: z.string().min(1).optional(), terminalId: z.string().min(1).optional() }), req.body);
     if (!body.sessionId && !body.terminalId) throw new HttpError(400, 'Indica sessionId o terminalId');
     const session = await col('cash_sessions').findOne(body.sessionId ? { _id: body.sessionId } : { terminalId: body.terminalId, status: 'abierta' });
@@ -124,10 +127,11 @@ cashRouter.post(
       }
       if (sum !== body.countedCents) throw new HttpError(400, 'El desglose de billetes y monedas no suma el efectivo contado');
     }
+    const authorization = await authorizeOnline(req, { perm: 'caja.corte', purpose: 'cierre_caja', raw: body.authorization, branchId: session.branchId });
     const now = new Date().toISOString();
     const op: SyncOp = {
       opId: newId(), type: 'cash.close', branchId: session.branchId, terminalId: session.terminalId, userId: user.id, localTs: now,
-      payload: { sessionId: session._id, closedBy: user.id, closedAt: now, countedCents: body.countedCents, denominations: body.denominations ?? null, notes: body.notes ?? null },
+      payload: { sessionId: session._id, closedBy: user.id, closedAt: now, countedCents: body.countedCents, denominations: body.denominations ?? null, notes: body.notes ?? null, ...(authorization ? { authorization } : {}) },
     };
     const r = await applySyncOp(repo, op, ctx());
     if (r.status === 'rejected') throw rejectionToHttp(r.conflictKind, r.detail);
@@ -135,6 +139,7 @@ cashRouter.post(
     res.json({
       ok: true, sessionId: session._id, expectedCents: closed?.expectedCents, countedCents: closed?.countedCents, differenceCents: closed?.differenceCents,
       provisional: !!closed?.provisional, breakdown: closed?.closure?.breakdown ?? null,
+      closedBy: closed?.closedBy ?? user.id, authorization: closed?.closeAuthorization ?? null, authorizedBy: closed?.closeAuthorizedBy ?? null,
     });
   }),
 );

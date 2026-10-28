@@ -20,6 +20,9 @@ const saleItem = z.object({
   unitCostCents: cents,
   lineDiscountCents: cents,
   netCents: cents,
+  // v2: por omisión 'producto'. Un 'extra' no mueve inventario ni cuenta como unidad vendida.
+  kind: z.enum(['producto', 'extra']).optional(),
+  extraNote: z.string().max(200).nullish(),
 });
 
 const paymentLine = z.object({
@@ -46,8 +49,16 @@ export const saleSchema = z.object({
   status: z.enum(['completada', 'cancelada']),
   items: z.array(saleItem).min(1).max(300),
   payments: z.array(paymentLine).min(1).max(10),
+  // v2: quién vendió (solo en sistema) y tipo de venta ('limpia' = Limpias).
+  sellerId: id.nullish(),
+  sellerName: z.string().max(100).nullish(),
+  type: z.enum(['venta', 'limpia']).optional(),
 });
-export const saleCreatePayload = z.object({ sale: saleSchema });
+/**
+ * `authorization` se deja como `unknown` a propósito: su validez se juzga en `checkAuthorization`
+ * (una autorización mal formada de una operación ya ocurrida es un CONFLICTO, no un rechazo del payload).
+ */
+export const saleCreatePayload = z.object({ sale: saleSchema, authorization: z.unknown().optional() });
 
 export const adjustmentSchema = z.object({
   id,
@@ -71,13 +82,14 @@ export const adjustmentSchema = z.object({
         unitCostCents: cents,
         netCents: cents,
         restock: z.boolean(),
+        kind: z.enum(['producto', 'extra']).optional(),
       }),
     )
     .min(1)
     .max(300),
   cashSessionId: id.nullable(),
 });
-export const saleAdjustPayload = z.object({ adjustment: adjustmentSchema });
+export const saleAdjustPayload = z.object({ adjustment: adjustmentSchema, authorization: z.unknown().optional() });
 
 export const stockMovementPayload = z.object({
   movement: z.object({
@@ -121,6 +133,8 @@ export const cashClosePayload = z.object({
   provisional: z.boolean().optional(),
   denominations: z.record(z.string(), z.number().int().min(0)).nullable().optional(),
   notes: z.string().max(300).nullable().optional(),
+  // v2: quién autorizó el cierre (vendedor: obligatoria). Se valida aparte; ver `checkAuthorization`.
+  authorization: z.unknown().optional(),
   // `breakdown` y `differenceCents` del dispositivo se ignoran: el servidor recalcula.
 });
 

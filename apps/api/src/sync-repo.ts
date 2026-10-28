@@ -1,5 +1,5 @@
 /** Implementación de `SyncRepo` sobre MongoDB. Toda inserción idempotente usa _id único y trata E11000 como "ya existía". */
-import type { CashMovement, Grant, Sale, SaleAdjustment } from '@amara/shared';
+import type { CachedSecurityToken, CashMovement, Grant, Sale, SaleAdjustment } from '@amara/shared';
 import { col } from './db.ts';
 import { incStock, insertMovement } from './stock.ts';
 import type {
@@ -76,6 +76,34 @@ export function createMongoSyncRepo(): SyncRepo {
     async getVariant(id) {
       const v = await col('variants').findOne({ _id: id }, { projection: { priceCents: 1, costCents: 1 } });
       return v ? ({ id: v._id, priceCents: v.priceCents, costCents: v.costCents } as VariantRec) : null;
+    },
+
+    async getSecurityToken(id) {
+      const d = await col('security_tokens').findOne({ _id: id });
+      return d ? strip<CachedSecurityToken>(d) : null;
+    },
+    async hasTokenUse(tokenId, opId) {
+      return (await col('security_token_uses').findOne({ _id: `${tokenId}:${opId}` }, { projection: { _id: 1 } })) !== null;
+    },
+    async consumeToken(tokenId, opId, atIso) {
+      // 1) La marca de uso es única por (token, operación): un reproceso no vuelve a contar.
+      const useId = `${tokenId}:${opId}`;
+      try {
+        await col('security_token_uses').insertOne({ _id: useId, tokenId, opId, at: atIso });
+      } catch (e) {
+        if (isDup(e)) return 'already';
+        throw e;
+      }
+      // 2) El incremento es condicional al máximo de usos (atómico): dos operaciones simultáneas no sobrepasan el tope.
+      const r = await col('security_tokens').updateOne(
+        { _id: tokenId, $or: [{ maxUses: null }, { $expr: { $lt: ['$usedCount', '$maxUses'] } }] },
+        { $inc: { usedCount: 1 }, $set: { lastUsedAt: atIso } },
+      );
+      if (r.matchedCount === 0) {
+        await col('security_token_uses').deleteOne({ _id: useId });
+        return 'exhausted';
+      }
+      return 'consumed';
     },
 
     async getSale(id) {

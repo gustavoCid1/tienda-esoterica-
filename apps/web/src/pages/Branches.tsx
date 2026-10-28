@@ -1,11 +1,11 @@
 import { useState, type FormEvent } from 'react';
-import { api, asList } from '../lib/api.ts';
-import { errorMessage, useAsync, useDirty } from '../lib/hooks.ts';
-import { buildBranchPayload, buildTerminalPayload, firstError, type BranchForm, type FieldErrors, type TerminalForm } from '../lib/forms.ts';
-import { formatMxDateTime } from '@amara/shared';
-import type { Branch, Terminal } from '../lib/types.ts';
+import { api } from '../lib/api.ts';
+import { errorMessage, useDirty } from '../lib/hooks.ts';
+import { buildBranchPayload, firstError, type BranchForm, type FieldErrors } from '../lib/forms.ts';
+import type { Branch } from '../lib/types.ts';
 import { Alert, Badge, Card, ConfirmDialog, Empty, ErrorBox, Field, Modal, PageHeader, Spinner, TableWrap, CloseButton } from '../components/ui.tsx';
 import { useBranches, useToast } from '../context.tsx';
+import { TerminalsCard } from './TerminalsPanel.tsx';
 
 export function Branches() {
   const { branches, loading, error, reload } = useBranches();
@@ -13,11 +13,6 @@ export function Branches() {
   const [editing, setEditing] = useState<Branch | 'new' | null>(null);
   const [toggle, setToggle] = useState<Branch | null>(null);
   const [busy, setBusy] = useState(false);
-
-  const terminals = useAsync((s) => api.get<unknown>('/admin/terminals', undefined, s).then((d) => asList<Terminal>(d)), []);
-  const [termEdit, setTermEdit] = useState(false);
-  const [revoke, setRevoke] = useState<Terminal | null>(null);
-  const [issued, setIssued] = useState<{ terminal: Terminal; token: string } | null>(null);
 
   const confirmToggle = async () => {
     if (!toggle) return;
@@ -33,32 +28,6 @@ export function Branches() {
       setBusy(false);
     }
   };
-
-  const issueToken = async (t: Terminal) => {
-    try {
-      const r = await api.post<{ token: string }>(`/admin/terminals/${t.id}/token`, {}, { reauth: true });
-      setIssued({ terminal: t, token: r.token });
-    } catch (e) {
-      notify(errorMessage(e), 'error');
-    }
-  };
-
-  const doRevoke = async () => {
-    if (!revoke) return;
-    setBusy(true);
-    try {
-      await api.post(`/admin/terminals/${revoke.id}/revoke`, {}, { reauth: true });
-      notify('Token de terminal revocado.');
-      setRevoke(null);
-      terminals.reload();
-    } catch (e) {
-      notify(errorMessage(e), 'error');
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const branchLabel = (id: string) => branches.find((b) => b.id === id)?.name ?? id.slice(0, 6);
 
   return (
     <>
@@ -94,36 +63,9 @@ export function Branches() {
         )}
       </Card>
 
-      <Card title="Terminales" actions={<button type="button" className="btn btn-sm btn-primary" onClick={() => setTermEdit(true)}>Nueva terminal</button>}>
-        {terminals.loading && !terminals.data && <Spinner />}
-        {terminals.error && <ErrorBox error={terminals.error} onRetry={terminals.reload} />}
-        {terminals.data && (terminals.data.length === 0 ? <Empty>No hay terminales.</Empty> : (
-          <TableWrap>
-            <table className="table">
-              <thead><tr><th>Código</th><th>Nombre</th><th>Sucursal</th><th>Tipo</th><th>Última sincronización</th><th>Estado</th><th /></tr></thead>
-              <tbody>
-                {terminals.data.map((t) => (
-                  <tr key={t.id}>
-                    <td><strong>{t.code}</strong></td>
-                    <td>{t.name}</td>
-                    <td>{branchLabel(t.branchId)}</td>
-                    <td>{t.kind === 'movil' ? 'Móvil' : 'Escritorio'}</td>
-                    <td>{t.lastSyncAt ? formatMxDateTime(t.lastSyncAt) : <span className="muted">Nunca</span>}</td>
-                    <td>{t.revokedAt ? <Badge tone="danger">Token revocado</Badge> : <Badge tone="ok">Activa</Badge>}</td>
-                    <td className="row-actions">
-                      <button type="button" className="btn btn-sm" onClick={() => issueToken(t)}>Emitir token</button>
-                      <button type="button" className="btn btn-sm btn-ghost" onClick={() => setRevoke(t)}>Revocar</button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </TableWrap>
-        ))}
-      </Card>
+      <TerminalsCard />
 
       {editing && <BranchModal branch={editing === 'new' ? null : editing} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); reload(); }} />}
-      {termEdit && <TerminalModal branches={branches} onClose={() => setTermEdit(false)} onSaved={() => { setTermEdit(false); terminals.reload(); }} />}
       {toggle && (
         <ConfirmDialog
           title={toggle.active === false ? 'Activar sucursal' : 'Desactivar sucursal'}
@@ -132,27 +74,6 @@ export function Branches() {
           onCancel={() => setToggle(null)}
           onConfirm={confirmToggle}
         />
-      )}
-      {revoke && (
-        <ConfirmDialog
-          title="Revocar token de terminal"
-          message={`La terminal ${revoke.name} dejará de poder sincronizar hasta que emitas un token nuevo.`}
-          confirmLabel="Revocar"
-          danger
-          busy={busy}
-          onCancel={() => setRevoke(null)}
-          onConfirm={doRevoke}
-        />
-      )}
-      {issued && (
-        <Modal title={`Token de ${issued.terminal.name}`} size="md" onClose={() => setIssued(null)}>
-          <Alert tone="warn" title="Cópialo ahora">Este token solo se muestra una vez. Pégalo en la configuración de la terminal; no lo compartas ni lo envíes por chat.</Alert>
-          <textarea className="mono" readOnly rows={4} value={issued.token} onFocus={(e) => e.currentTarget.select()} aria-label="Token de terminal" />
-          <div className="btn-row">
-            <button type="button" className="btn" onClick={() => navigator.clipboard?.writeText(issued.token).then(() => notify('Copiado.'), () => notify('No se pudo copiar; selecciónalo manualmente.', 'error'))}>Copiar</button>
-            <button type="button" className="btn btn-primary" onClick={() => setIssued(null)}>Listo</button>
-          </div>
-        </Modal>
       )}
     </>
   );
@@ -250,68 +171,6 @@ function BranchModal({ branch, onClose, onSaved }: { branch: Branch | null; onCl
             </span>
           ))}
         </div>
-      </form>
-    </Modal>
-  );
-}
-
-function TerminalModal({ branches, onClose, onSaved }: { branches: Branch[]; onClose: () => void; onSaved: () => void }) {
-  const { notify } = useToast();
-  const [form, setForm] = useState<TerminalForm>({ code: '', name: '', branchId: branches[0]?.id ?? '', kind: 'escritorio' });
-  const [errors, setErrors] = useState<FieldErrors>({});
-  const [serverError, setServerError] = useState('');
-  const [busy, setBusy] = useState(false);
-  const dirty = useDirty(form);
-
-  const submit = async (e: FormEvent) => {
-    e.preventDefault();
-    const r = buildTerminalPayload(form);
-    setErrors(r.errors);
-    if (!r.payload) return;
-    setBusy(true);
-    try {
-      await api.post('/admin/terminals', r.payload);
-      notify('Terminal creada. Emite su token para vincularla.');
-      onSaved();
-    } catch (err) {
-      setServerError(errorMessage(err));
-      setBusy(false);
-    }
-  };
-
-  return (
-    <Modal
-      title="Nueva terminal"
-      size="sm"
-      dirty={dirty}
-      onClose={onClose}
-      footer={
-        <>
-          <CloseButton label="Cancelar" disabled={busy} />
-          <button type="submit" form="terminal-form" className="btn btn-primary" disabled={busy}>{busy ? 'Guardando...' : 'Crear'}</button>
-        </>
-      }
-    >
-      <form id="terminal-form" className="form" onSubmit={submit} noValidate>
-        {serverError && <Alert tone="error">{serverError}</Alert>}
-        <Field label="Código" required hint="1 a 3 mayúsculas o números, único en todo el sistema" error={errors.code}>
-          <input value={form.code} maxLength={3} onChange={(e) => setForm({ ...form, code: e.target.value.toUpperCase() })} />
-        </Field>
-        <Field label="Nombre" required error={errors.name}>
-          <input value={form.name} maxLength={60} onChange={(e) => setForm({ ...form, name: e.target.value })} />
-        </Field>
-        <Field label="Sucursal" required error={errors.branchId}>
-          <select value={form.branchId} onChange={(e) => setForm({ ...form, branchId: e.target.value })}>
-            <option value="">Elige una sucursal</option>
-            {branches.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
-          </select>
-        </Field>
-        <Field label="Tipo" error={errors.kind}>
-          <select value={form.kind} onChange={(e) => setForm({ ...form, kind: e.target.value as TerminalForm['kind'] })}>
-            <option value="escritorio">Escritorio</option>
-            <option value="movil">Móvil</option>
-          </select>
-        </Field>
       </form>
     </Modal>
   );

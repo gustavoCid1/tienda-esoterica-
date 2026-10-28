@@ -2,31 +2,22 @@
  * Estado de la venta en curso (carrito, descuento, modo VENTA/INVENTARIO y última venta).
  * Vive fuera de la pantalla para no perderse al cambiar de pestaña. Se vacía al cerrar sesión.
  */
-import { createContext, useCallback, useContext, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { CatalogHit } from '@amara/database';
+import { newId } from '@amara/shared';
 import type { Sale } from '@amara/shared';
-import type { PrintResult } from '../../shared/ipc.ts';
+import * as cart from '../lib/cart.ts';
+import type { AddResult, CartLine, ExtraResult } from '../lib/cart.ts';
 
-export interface CartLine {
-  variantId: string;
-  productName: string;
-  label: string;
-  code: string;
-  unitPriceCents: number;
-  qty: number;
-  /** Existencia local al agregar (para avisar si no hay). */
-  stockQty: number;
-}
+export type { CartLine } from '../lib/cart.ts';
 
 export type PosMode = 'venta' | 'inventario';
 
+/** Última venta guardada. El ticket se ve e imprime en el modal de vista previa (no hay impresión oculta). */
 export interface LastSale {
   sale: Sale;
   warnings: string[];
-  /** null = aún no se intenta imprimir. */
-  print: 'imprimiendo' | 'ok' | 'error' | 'omitida';
-  printResult: PrintResult | null;
 }
 
 interface PosApi {
@@ -37,14 +28,15 @@ interface PosApi {
   setDiscountCents: (c: number) => void;
   subtotalCents: number;
   totalCents: number;
-  addHit: (h: CatalogHit) => void;
-  setQty: (variantId: string, qty: number) => void;
-  remove: (variantId: string) => void;
+  /** Agrega una pieza. Si no hay existencia (o ya se agregó todo) NO agrega y explica por qué. */
+  addHit: (h: CatalogHit) => AddResult;
+  /** Agrega una línea Extra ligada a un producto del carrito. */
+  addExtra: (parentKey: string, amountCents: number, note: string) => ExtraResult;
+  setQty: (key: string, qty: number) => void;
+  remove: (key: string) => void;
   clearCart: () => void;
   lastSale: LastSale | null;
   setLastSale: (l: LastSale | null) => void;
-  /** Actualiza la última venta SOLO si sigue siendo la misma (evita pisar una venta más nueva). */
-  patchLastSale: (saleId: string, p: Partial<LastSale>) => void;
   /** Etiquetas que se mandan desde Inventario a la pantalla de etiquetas. */
   labelQueue: CatalogHit[];
   setLabelQueue: (h: CatalogHit[]) => void;
@@ -65,26 +57,48 @@ export function PosProvider({ children }: { children: ReactNode }) {
   const [lastSale, setLastSale] = useState<LastSale | null>(null);
   const [labelQueue, setLabelQueue] = useState<CatalogHit[]>([]);
 
-  const subtotalCents = useMemo(() => lines.reduce((a, l) => a + l.qty * l.unitPriceCents, 0), [lines]);
+  const subtotalCents = useMemo(() => cart.subtotalOf(lines), [lines]);
   const safeDiscount = Math.min(discountCents, subtotalCents);
   const totalCents = subtotalCents - safeDiscount;
 
-  const addHit = useCallback((h: CatalogHit) => {
-    setLines((prev) => {
-      const i = prev.findIndex((l) => l.variantId === h.variantId);
-      if (i >= 0) return prev.map((l, k) => (k === i ? { ...l, qty: l.qty + 1 } : l));
-      return [
-        ...prev,
-        { variantId: h.variantId, productName: h.productName, label: h.label, code: h.barcode ?? h.internalCode, unitPriceCents: h.priceCents, qty: 1, stockQty: h.qty },
-      ];
-    });
+  // El carrito se calcula sobre la lista más reciente (ref) para que dos lecturas seguidas del escáner nunca pisen la existencia.
+  const linesRef = useRef<CartLine[]>([]);
+  linesRef.current = lines;
+
+  const addHit = useCallback((h: CatalogHit): AddResult => {
+    const r = cart.addProduct(linesRef.current, h);
+    if (r.ok) {
+      linesRef.current = r.lines;
+      setLines(r.lines);
+    }
+    return r;
   }, []);
 
-  const setQty = useCallback((variantId: string, qty: number) => {
-    setLines((prev) => prev.map((l) => (l.variantId === variantId ? { ...l, qty: Math.max(1, Math.min(9999, Math.floor(qty) || 1)) } : l)));
+  const addExtra = useCallback((parentKey: string, amountCents: number, note: string): ExtraResult => {
+    const r = cart.addExtra(linesRef.current, parentKey, amountCents, note, newId());
+    if (r.ok) {
+      linesRef.current = r.lines;
+      setLines(r.lines);
+    }
+    return r;
   }, []);
-  const remove = useCallback((variantId: string) => setLines((prev) => prev.filter((l) => l.variantId !== variantId)), []);
+
+  const setQty = useCallback((key: string, qty: number) => {
+    setLines((prev) => {
+      const next = cart.setQty(prev, key, qty);
+      linesRef.current = next;
+      return next;
+    });
+  }, []);
+  const remove = useCallback((key: string) => {
+    setLines((prev) => {
+      const next = cart.removeLine(prev, key);
+      linesRef.current = next;
+      return next;
+    });
+  }, []);
   const clearCart = useCallback(() => {
+    linesRef.current = [];
     setLines([]);
     setDiscount(0);
   }, []);
@@ -92,11 +106,10 @@ export function PosProvider({ children }: { children: ReactNode }) {
   const value = useMemo<PosApi>(
     () => ({
       mode, setMode, lines, discountCents: safeDiscount, setDiscountCents: setDiscount, subtotalCents, totalCents,
-      addHit, setQty, remove, clearCart, lastSale, setLastSale,
-      patchLastSale: (saleId, p) => setLastSale((cur) => (cur && cur.sale.id === saleId ? { ...cur, ...p } : cur)),
+      addHit, addExtra, setQty, remove, clearCart, lastSale, setLastSale,
       labelQueue, setLabelQueue,
     }),
-    [mode, lines, safeDiscount, subtotalCents, totalCents, addHit, setQty, remove, clearCart, lastSale, labelQueue],
+    [mode, lines, safeDiscount, subtotalCents, totalCents, addHit, addExtra, setQty, remove, clearCart, lastSale, labelQueue],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

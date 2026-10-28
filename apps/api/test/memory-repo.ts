@@ -1,5 +1,5 @@
 /** Repositorio en memoria para probar sync-apply sin MongoDB. Imita las garantías de unicidad por _id. */
-import type { CashMovement, Grant, Sale, SaleAdjustment } from '@amara/shared';
+import type { CachedSecurityToken, CashMovement, Grant, Sale, SaleAdjustment } from '@amara/shared';
 import type {
   AuditRec, CashData, CashSessionRec, ConflictRec, StoredAdjustment, StoredMovement, StoredSale, SyncEventRec, SyncRepo, TerminalRec, UserRec, VariantRec,
 } from '../src/sync-apply.ts';
@@ -18,6 +18,9 @@ export class MemoryRepo implements SyncRepo {
   cashMovements = new Map<string, CashMovement & { receivedAt: string; syncOpId: string }>();
   conflicts = new Map<string, ConflictRec>();
   audits = new Map<string, AuditRec>();
+  /** v2 */
+  tokens = new Map<string, CachedSecurityToken>();
+  tokenUses = new Set<string>();
 
   /** Inyección de fallos: lanza la próxima vez que se llame al método indicado. */
   failOnce: Partial<Record<'incStock', Error>> = {};
@@ -56,6 +59,22 @@ export class MemoryRepo implements SyncRepo {
   }
   async getVariant(id: string) {
     return this.variants.get(id) ?? null;
+  }
+
+  async getSecurityToken(id: string) {
+    return this.tokens.get(id) ?? null;
+  }
+  async hasTokenUse(tokenId: string, opId: string) {
+    return this.tokenUses.has(`${tokenId}:${opId}`);
+  }
+  async consumeToken(tokenId: string, opId: string) {
+    const key = `${tokenId}:${opId}`;
+    if (this.tokenUses.has(key)) return 'already' as const;
+    const t = this.tokens.get(tokenId);
+    if (!t || (t.maxUses !== null && t.usedCount >= t.maxUses)) return 'exhausted' as const;
+    this.tokenUses.add(key);
+    t.usedCount += 1;
+    return 'consumed' as const;
   }
 
   async getSale(id: string) {

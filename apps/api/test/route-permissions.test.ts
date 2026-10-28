@@ -19,7 +19,9 @@ const fakeAuth: RequestHandler = (req, _res, next) => {
 const api = request(createApp({ authenticate: fakeAuth, corsOrigins: ['http://localhost:5173'] }));
 const as = (role: Role) => ({ 'x-test-role': role });
 
-const STATS_GET = ['/stats/today', '/stats/summary', '/stats/months', '/stats/dashboard', '/stats/reports/daily', '/stats/reports/weekly', '/stats/reports/monthly', '/stats/cualquier-cosa-futura'];
+const STATS_GET = ['/stats/today', '/stats/summary', '/stats/months', '/stats/dashboard', '/stats/reports/daily', '/stats/reports/weekly', '/stats/reports/monthly', '/stats/cualquier-cosa-futura',
+  // v2
+  '/stats/low-stock', '/stats/top-products-series', '/stats/product-series?productId=x'];
 
 describe('estadísticas y reportes: solo gerente', () => {
   for (const role of ['vendedor', 'desarrollador'] as const) {
@@ -157,5 +159,50 @@ describe('autenticación real y errores', () => {
     expect(allowed.headers['access-control-allow-origin']).toBe('http://localhost:5173');
     const denied = await api.get('/health').set('Origin', 'https://malicioso.example');
     expect(denied.headers['access-control-allow-origin']).toBeUndefined();
+  });
+});
+
+
+describe('v2: tokens de seguridad, configuración de extras y resumen de hoy', () => {
+  const AUTH = { kind: 'admin_password', adminUserId: 'g' };
+  for (const role of ['vendedor', 'desarrollador'] as const) {
+    it(`${role} no administra tokens ni la configuración de extras (403 sin tocar la base)`, async () => {
+      expect((await api.get('/security/tokens').set(as(role))).status).toBe(403);
+      expect((await api.post('/security/tokens').set(as(role)).send({})).status).toBe(403);
+      expect((await api.post('/security/tokens/x/revoke').set(as(role)).send({})).status).toBe(403);
+      expect((await api.put('/settings/extra-categories').set(as(role)).send({ categories: ['A'] })).status).toBe(403);
+    });
+    it(`${role} no ve el resumen de tickets de hoy`, async () => {
+      expect((await api.get('/sales/today-summary').set(as(role))).status).toBe(403);
+    });
+  }
+  it('el desarrollador no cierra caja, cancela ni devuelve, ni con autorización', async () => {
+    expect((await api.post('/cash/close').set(as('desarrollador')).send({ countedCents: 0, terminalId: 't', authorization: AUTH })).status).toBe(403);
+    expect((await api.post('/sales/x/cancel').set(as('desarrollador')).send({ reason: 'abc', authorization: AUTH })).status).toBe(403);
+    expect((await api.post('/sales/x/return').set(as('desarrollador')).send({ authorization: AUTH })).status).toBe(403);
+  });
+  it('el vendedor SIN authorization sigue en 403 al cerrar, cancelar y devolver', async () => {
+    expect((await api.post('/cash/close').set(as('vendedor')).send({ countedCents: 0, terminalId: 't' })).status).toBe(403);
+    expect((await api.post('/sales/x/cancel').set(as('vendedor')).send({ reason: 'abc' })).status).toBe(403);
+    expect((await api.post('/sales/x/return').set(as('vendedor')).send({})).status).toBe(403);
+  });
+  it('crear un token exige reautenticación del gerente → 401', async () => {
+    expect((await api.post('/security/tokens').set(as('gerente')).send({ label: 'Cierre', purposes: ['cierre_caja'], durationMinutes: 60 })).status).toBe(401);
+  });
+  it('/security/verify valida el cuerpo antes de tocar la base (código o contraseña, uno solo)', async () => {
+    const ok = { purpose: 'cierre_caja', branchId: BR };
+    expect((await api.post('/security/verify').set(as('vendedor')).send(ok)).status).toBe(400);
+    expect((await api.post('/security/verify').set(as('vendedor')).send({ ...ok, code: 'ABC', adminPassword: 'x' })).status).toBe(400);
+    expect((await api.post('/security/verify').set(as('vendedor')).send({ ...ok, code: 'ABC', purpose: 'otro' })).status).toBe(400);
+  });
+  it('una terminal con token no administra tokens ni lee la configuración', async () => {
+    const term = { 'x-test-terminal': '1' };
+    expect((await api.get('/security/tokens').set(term)).status).toBe(403);
+    expect((await api.post('/security/tokens/x/revoke').set(term).send({})).status).toBe(403);
+    expect((await api.get('/settings/extra-categories').set(term)).status).toBe(403);
+  });
+  it('el vendedor no puede crear terminales ni emitir su token', async () => {
+    expect((await api.post('/admin/terminals').set(as('vendedor')).send({ kind: 'movil', branchId: BR })).status).toBe(403);
+    expect((await api.patch('/admin/terminals/x').set(as('vendedor')).send({ assignedTo: 'Ana' })).status).toBe(403);
   });
 });

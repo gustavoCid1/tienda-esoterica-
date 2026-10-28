@@ -6,6 +6,7 @@ import { useCallback, useEffect, useState } from 'react';
 import * as QRCodeNs from 'qrcode';
 import type { AppSettings } from '../../shared/settings.ts';
 import type { BackupLogRow, LanState, PrinterInfo } from '../../shared/ipc.ts';
+import { ExtraCategoriesCard } from '../components/ExtraCategoriesCard.tsx';
 import { Banner, Field } from '../components/Field.tsx';
 import { Modal } from '../components/Modal.tsx';
 import { call, errorText, onEvent } from '../lib/api.ts';
@@ -158,8 +159,8 @@ export function SettingsScreen() {
               <option value="medido">Medir el largo del ticket</option>
             </select>
           </Field>
-          <Field label="Al guardar una venta">
-            <label className="check"><input type="checkbox" checked={draft.autoPrint} onChange={(e) => set('autoPrint', e.target.checked)} /> Imprimir automáticamente las dos copias (cliente y tienda)</label>
+          <Field label="Al guardar una venta" hint="Siempre se abre la vista previa del ticket con el botón Imprimir (manda las dos copias)">
+            <label className="check"><input type="checkbox" checked={draft.autoPrint} onChange={(e) => set('autoPrint', e.target.checked)} /> Imprimir solas las dos copias al abrir la vista previa</label>
           </Field>
         </div>
         <Field label="Texto al pie del ticket"><input className="inp" value={draft.ticketFooter} maxLength={120} onChange={(e) => set('ticketFooter', e.target.value)} /></Field>
@@ -183,6 +184,8 @@ export function SettingsScreen() {
         </div>
         <button className="btn" onClick={() => void testPrint('label')} disabled={busy !== null}>Imprimir etiqueta de prueba</button>
       </section>
+
+      <ExtraCategoriesCard />
 
       <section className="card">
         <h3>Respaldos de la base de datos</h3>

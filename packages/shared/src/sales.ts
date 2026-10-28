@@ -3,7 +3,7 @@
  * Es la ÚNICA implementación; escritorio, móvil y API la comparten para que
  * los importes coincidan siempre.
  */
-import type { PaymentLine, PaymentMethod } from './types.ts';
+import type { PaymentLine, PaymentMethod, SaleItemKind } from './types.ts';
 import { isIntCents } from './money.ts';
 
 export class SaleValidationError extends Error {
@@ -21,6 +21,11 @@ export interface SaleLineInput {
   unitPriceCents: number;
   unitCostCents: number;
   lineDiscountCents?: number;
+  /**
+   * v2. Por omisión 'producto'. Una línea 'extra' (cargo adicional sobre un producto) exige qty = 1,
+   * costo 0 y precio ≥ 0; admite descuento de línea y participa del descuento general como cualquier línea.
+   */
+  kind?: SaleItemKind;
 }
 
 export interface PaymentInput {
@@ -82,6 +87,13 @@ export function computeSale(
   const base = lines.map((l) => {
     if (!Number.isInteger(l.qty) || l.qty <= 0) {
       throw new SaleValidationError('cantidad_invalida', 'La cantidad debe ser un entero mayor a cero');
+    }
+    if (l.kind !== undefined && l.kind !== 'producto' && l.kind !== 'extra') {
+      throw new SaleValidationError('linea_invalida', 'Tipo de línea desconocido');
+    }
+    if (l.kind === 'extra') {
+      if (l.qty !== 1) throw new SaleValidationError('cantidad_invalida', 'Una línea extra siempre es de 1 unidad');
+      if (l.unitCostCents !== 0) throw new SaleValidationError('precio_invalido', 'Una línea extra no tiene costo');
     }
     if (!isIntCents(l.unitPriceCents) || l.unitPriceCents < 0 || !isIntCents(l.unitCostCents) || l.unitCostCents < 0) {
       throw new SaleValidationError('precio_invalido', 'Precio o costo inválido');

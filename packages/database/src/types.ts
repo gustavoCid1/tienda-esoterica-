@@ -1,11 +1,14 @@
-import type { Grant, Role, SyncResult } from '@amara/shared';
+import type { CachedSecurityToken, Grant, Role, SaleItemKind, SyncResult } from '@amara/shared';
 
 export class StoreError extends Error {
   code: string;
-  constructor(code: string, message: string) {
+  /** v2. Datos opcionales para la interfaz (p. ej. variantId y disponible en 'sin_existencia'). */
+  data?: Record<string, unknown>;
+  constructor(code: string, message: string, data?: Record<string, unknown>) {
     super(message);
     this.name = 'StoreError';
     this.code = code;
+    if (data) this.data = data;
   }
 }
 
@@ -61,8 +64,19 @@ export interface PullPayload {
   variants: CatalogVariant[];
   /** Existencia del servidor por variante y sucursal (lista completa de las sucursales autorizadas). */
   stock: { variantId: string; branchId: string; qty: number; location?: string | null }[];
-  users: { id: string; username: string; name: string; role: Role; branchIds: string[]; active: boolean }[];
+  users: {
+    id: string; username: string; name: string; role: Role; branchIds: string[]; active: boolean;
+    /**
+     * v2. Solo para gerentes activos de la sucursal: verificador de contraseña (hash scrypt, nunca la contraseña)
+     * para poder pedir "contraseña de administrador" SIN internet. Si no viene, se conserva el que ya había.
+     */
+    verifier?: string | null;
+  }[];
   grants: Grant[];
+  /** v2. Tokens de seguridad vigentes o recientes (solo hashes). Si viene, REEMPLAZA la caché local. */
+  securityTokens?: CachedSecurityToken[];
+  /** v2. Configuración del servidor. */
+  settings?: { extraCategories?: string[] };
 }
 
 /** Resultado de buscar un código/producto con su existencia local en la sucursal. */
@@ -93,12 +107,14 @@ export interface TicketPayload {
   folio: string;
   createdAt: string;
   userName: string;
-  items: { name: string; label: string; qty: number; unitPriceCents: number; netCents: number }[];
+  items: { name: string; label: string; qty: number; unitPriceCents: number; netCents: number; kind?: SaleItemKind; extraNote?: string | null }[];
   subtotalCents: number;
   discountCents: number;
   totalCents: number;
   payments: { method: string; amountCents: number; tenderedCents?: number; changeCents?: number }[];
   status: string;
+  /** v2. Ticket de una venta 'limpia' (para titularlo distinto). El vendedor (sellerName) NO se imprime. */
+  saleType?: 'venta' | 'limpia';
 }
 
 export type { SyncResult };

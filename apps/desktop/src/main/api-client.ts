@@ -21,7 +21,7 @@ export const electronFetch = ((input: string | URL | Request, init?: RequestInit
 export async function apiRequest<T>(
   baseUrl: string,
   path: string,
-  o: { method?: 'GET' | 'POST' | 'PATCH'; token?: string | null; body?: unknown; timeoutMs?: number; headers?: Record<string, string> } = {},
+  o: { method?: 'GET' | 'POST' | 'PATCH' | 'PUT'; token?: string | null; body?: unknown; timeoutMs?: number; headers?: Record<string, string> } = {},
 ): Promise<T> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), o.timeoutMs ?? 15_000);

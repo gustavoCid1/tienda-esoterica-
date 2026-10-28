@@ -4,7 +4,9 @@ import type { FormEvent } from 'react';
 import type { CatalogHit } from '@amara/database';
 import { newId } from '@amara/shared';
 import type { Sale } from '@amara/shared';
-import { call, errorText } from '../lib/api.ts';
+import type { SellerRow } from '../../shared/ipc.ts';
+import { call, errorCode, errorText } from '../lib/api.ts';
+import { stockView, toSaleItems } from '../lib/cart.ts';
 import { money, parsePesos, pesosText } from '../lib/format.ts';
 import { planPayments } from '../lib/payments.ts';
 import type { PaymentDraft } from '../lib/payments.ts';
@@ -19,9 +21,15 @@ export interface PaidResult {
 }
 
 export function PaymentModal({
-  totalCents, discountCents, lines, onClose, onPaid,
+  totalCents, discountCents, lines, seller, saleType = 'venta', ticket, onClose, onPaid,
 }: {
-  totalCents: number; discountCents: number; lines: CartLine[]; onClose: () => void; onPaid: (r: PaidResult) => void;
+  totalCents: number; discountCents: number; lines: CartLine[];
+  /** Empleado elegido en la ventana previa: se guarda en la venta, NO se imprime. */
+  seller: SellerRow;
+  saleType?: 'venta' | 'limpia';
+  /** Boleto de autorización (Limpias de un vendedor). */
+  ticket?: string;
+  onClose: () => void; onPaid: (r: PaidResult) => void;
 }) {
   // El id se crea UNA vez al abrir: si el cobro se reintenta (o se da doble clic), es la MISMA venta
   // y el almacén responde "duplicada" en vez de registrar dos.
@@ -61,13 +69,17 @@ export function PaymentModal({
     try {
       const r = await call('sales:create', {
         saleId: saleId.current,
-        items: lines.map((l) => ({ variantId: l.variantId, qty: l.qty })),
+        items: toSaleItems(lines),
         discountCents,
         payments: plan.payments,
+        sellerId: seller.id,
+        type: saleType,
+        ticket,
       });
       onPaid(r);
     } catch (err) {
-      setError(errorText(err));
+      // Sin existencia: el mensaje del almacén dice cuál producto y cuánto hay; no se registra nada.
+      setError(errorCode(err) === 'sin_existencia' ? `${errorText(err)}. No se guardó la venta: cierra esta ventana, ajusta la cantidad y vuelve a cobrar.` : errorText(err));
       submitting.current = false;
       setBusy(false);
     }
@@ -77,7 +89,7 @@ export function PaymentModal({
 
   return (
     <Modal
-      title="Cobrar"
+      title={saleType === 'limpia' ? 'Cobrar limpia' : 'Cobrar'}
       size="md"
       onClose={onClose}
       dirty={dirty}
@@ -96,6 +108,7 @@ export function PaymentModal({
           <span>Total a cobrar</span>
           <strong>{money(totalCents)}</strong>
         </div>
+        <div className="muted small">Vende: <strong>{seller.name}</strong> (queda en el sistema; no sale en el ticket)</div>
         <div className="grid3">
           <Field label="Tarjeta ($)">
             <input className="inp" inputMode="decimal" value={card} onChange={(e) => setCard(e.target.value)} placeholder="0.00" />
@@ -197,7 +210,7 @@ export function VariantChoiceModal({ hits, onClose, onPick }: { hits: CatalogHit
         {hits.map((h) => (
           <button key={h.variantId} className="btn btn-block btn-left" onClick={() => onPick(h)}>
             <strong>{h.productName}</strong> - {h.label}
-            <span className="muted"> ({money(h.priceCents)}, existencia {h.qty})</span>
+            <span className="muted"> ({money(h.priceCents)}, {stockView(h.qty).text.toLowerCase()})</span>
           </button>
         ))}
       </div>

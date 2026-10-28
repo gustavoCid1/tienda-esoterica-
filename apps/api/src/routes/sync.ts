@@ -67,7 +67,7 @@ syncRouter.get(
     } else {
       throw new HttpError(401, 'Falta iniciar sesión');
     }
-    const payload = await buildPullPayload([branchId], q.since);
+    const payload = await buildPullPayload([branchId], q.since, { verifiers: true });
     if (req.terminal) await col('terminals').updateOne({ _id: req.terminal.id }, { $set: { lastPullAt: payload.serverTime } }).catch(() => undefined);
     res.json(payload);
   }),

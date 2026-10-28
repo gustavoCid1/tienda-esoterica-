@@ -1,0 +1,58 @@
+/* Esotérica Amara - estilos de la versión 2.
+   Archivo NUEVO: no modifica ni redefine styles.css (la dueña lo personalizó). Solo USA sus
+   variables (--gold, --ink, --line...). Cualquier color propio nuevo se limita al violeta del
+   "ticket de permiso", que debe ser distinto al del ticket normal. */
+
+/* ---------- Vista previa de PDF ---------- */
+.pdf-frame { width: 100%; height: 68vh; min-height: 360px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg-2); }
+
+/* ---------- Datos con botón de copiar (terminales) ---------- */
+.dl-copy { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; }
+.dl-copy .dl-row { display: grid; grid-template-columns: 90px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--line-2); }
+.dl-copy dt { color: var(--ink-3); font-size: 12px; }
+.dl-copy dd { margin: 0; }
+.mono-wrap { font-family: ui-monospace, Consolas, monospace; font-size: 12px; word-break: break-all; }
+
+/* ---------- Token de seguridad ---------- */
+.token-code {
+  font-family: ui-monospace, Consolas, monospace; font-size: 30px; font-weight: 700; letter-spacing: 0.18em; text-align: center;
+  padding: 14px 8px; margin: 8px 0; border: 2px dashed var(--ink-3); border-radius: var(--radius); background: var(--bg-2);
+  word-break: break-all; user-select: all;
+}
+
+/* ---------- Serie de productos más vendidos ---------- */
+.series-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: flex-end; }
+.series-pick { margin-top: 12px; }
+.series-detail { margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+.series-top { margin: 0; padding: 10px 12px; border-left: 4px solid var(--gold-2); background: var(--gold-soft); border-radius: 6px; }
+.table .row-top td { background: var(--gold-soft); font-weight: 700; }
+
+/* ---------- Menú: contador y campana de notificaciones ---------- */
+.nav-link .nav-badge {
+  float: right; min-width: 20px; padding: 0 6px; border-radius: 999px; text-align: center; font-size: 11px; line-height: 18px; font-weight: 700;
+  background: var(--danger); color: #fff;
+}
+.bell { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 50%; color: var(--ink-2); text-decoration: none; margin-left: auto; }
+.bell + .topbar-user { margin-left: 0; }
+.bell:hover { background: var(--gold-soft); color: var(--ink); }
+.bell.active { color: var(--gold); }
+.bell-count {
+  position: absolute; top: 0; right: 0; min-width: 16px; padding: 0 4px; border-radius: 999px; font-size: 10px; line-height: 16px; font-weight: 700; text-align: center;
+  background: var(--danger); color: #fff;
+}
+
+/* ---------- Extras (categorías) ---------- */
+.extra-add { margin-top: 12px; max-width: 420px; }
+.extra-add + .field-error { margin: 6px 0 0; }
+
+/* ---------- Auditoría ---------- */
+.audit-detail { max-width: 460px; word-break: break-word; color: var(--ink-2); }
+
+/* ---------- Controles de la gráfica en pantallas angostas ---------- */
+@media (max-width: 640px) {
+  .series-controls { justify-content: flex-start; }
+  .dl-copy .dl-row { grid-template-columns: 1fr auto; }
+  .dl-copy dt { grid-column: 1 / -1; }
+  .token-code { font-size: 24px; }
+  .pdf-frame { height: 60vh; }
+}

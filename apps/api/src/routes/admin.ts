@@ -11,6 +11,8 @@ import { config } from '../config.ts';
 import { col, getDb } from '../db.ts';
 import { ah, HttpError, out, parse } from '../http.ts';
 import { publicUser } from '../serialize.ts';
+import { auditView, normalizeEntityFilter } from '../audit-view.ts';
+import { nextTerminalCode, terminalName, terminalPublic } from '../terminals.ts';
 import { compact, dayRangeIso, dayStr, isoRangeFilter, pageQuery, runMw, sessionUser } from '../util.ts';
 
 export const adminRouter = Router();
@@ -162,10 +164,7 @@ adminRouter.patch(
 
 // ───────────────────────────── Terminales ─────────────────────────────
 
-const terminalView = (t: Record<string, any>) => {
-  const { _id, tokenVersion: _v, ...rest } = t;
-  return { id: _id, ...rest };
-};
+const terminalView = terminalPublic;
 
 adminRouter.get(
   '/terminals',
@@ -185,15 +184,29 @@ adminRouter.post(
     const body = parse(terminalSchema, req.body);
     assertBranch(me, body.branchId);
     if (!(await col('branches').findOne({ _id: body.branchId }, { projection: { _id: 1 } }))) throw new HttpError(400, 'La sucursal no existe');
+    // v2: sin código, el servidor toma el siguiente libre (P1, P2… / M1, M2…); sin nombre, lo arma con el tipo y la persona.
+    let code = body.code;
+    if (!code) {
+      const codes = (await col('terminals').find({}).project({ code: 1 }).toArray()).map((t) => t.code as string);
+      const next = nextTerminalCode(body.kind, codes);
+      if (!next) throw new HttpError(409, 'Se agotaron los códigos automáticos: escribe uno');
+      code = next;
+    }
+    const name = body.name ?? terminalName(body.kind, body.assignedTo, code);
     const id = newId();
     const now = new Date().toISOString();
     try {
-      await col('terminals').insertOne({ _id: id, id, code: body.code, name: body.name, branchId: body.branchId, kind: body.kind, revoked: false, tokenVersion: 0, lastSyncAt: null, createdAt: now, updatedAt: now });
+      await col('terminals').insertOne({
+        _id: id, id, code, name, branchId: body.branchId, kind: body.kind, assignedTo: body.assignedTo ?? null,
+        revoked: false, tokenVersion: 0, lastSyncAt: null, createdAt: now, updatedAt: now,
+      });
     } catch (e) {
       throw dupMsg(e, 'Ya existe una terminal con ese código');
     }
-    await audit({ userId: me.id, action: 'terminal.crear', entity: 'terminal', entityId: id, branchId: body.branchId, detail: { code: body.code, kind: body.kind } });
-    res.status(201).json({ terminal: terminalView((await col('terminals').findOne({ _id: id }))!) });
+    await audit({ userId: me.id, action: 'terminal.crear', entity: 'terminal', entityId: id, branchId: body.branchId, detail: { code, name, kind: body.kind, assignedTo: body.assignedTo ?? null } });
+    const view = terminalView((await col('terminals').findOne({ _id: id }))!);
+    // El terminal completo en la raíz (contrato v2) y también dentro de `terminal` (forma v1).
+    res.status(201).json({ ...view, terminal: view });
   }),
 );
 
@@ -210,13 +223,14 @@ adminRouter.patch(
   requirePerm('sucursales.gestionar'),
   ah(async (req, res) => {
     const { me, t } = await loadTerminal(req);
-    const patch = parse(z.object({ name: z.string().trim().min(2).max(60).optional(), kind: z.enum(['escritorio', 'movil']).optional() }), req.body);
+    const patch = parse(z.object({ name: z.string().trim().min(2).max(60).optional(), kind: z.enum(['escritorio', 'movil']).optional(), assignedTo: z.string().trim().min(1).max(80).optional() }), req.body);
     const set: Record<string, unknown> = compact({ ...patch });
-    if (Object.keys(set).length === 0) return void res.json({ terminal: terminalView(t), unchanged: true });
+    if (Object.keys(set).length === 0) return void res.json({ ...terminalView(t), terminal: terminalView(t), unchanged: true });
     set.updatedAt = new Date().toISOString();
     await col('terminals').updateOne({ _id: t._id }, { $set: set });
     await audit({ userId: me.id, action: 'terminal.editar', entity: 'terminal', entityId: t._id, branchId: t.branchId, detail: { changes: patch } });
-    res.json({ terminal: terminalView((await col('terminals').findOne({ _id: t._id }))!) });
+    const view = terminalView((await col('terminals').findOne({ _id: t._id }))!);
+    res.json({ ...view, terminal: view });
   }),
 );
 
@@ -230,7 +244,7 @@ adminRouter.post(
     const upd = await col('terminals').findOneAndUpdate({ _id: t._id }, { $inc: { tokenVersion: 1 }, $set: { revoked: false, tokenIssuedAt: new Date().toISOString(), tokenIssuedBy: me.id } }, { returnDocument: 'after' });
     const token = await signTerminal(t._id, upd!.tokenVersion);
     await audit({ userId: me.id, action: 'terminal.token_emitido', entity: 'terminal', entityId: t._id, branchId: t.branchId, detail: { code: t.code } });
-    res.json({ terminalId: t._id, token, note: 'Guarda este token ahora en la terminal: no se puede volver a consultar. Al emitir uno nuevo, el anterior deja de funcionar.' });
+    res.json({ terminalId: t._id, code: t.code, name: t.name, kind: t.kind, branchId: t.branchId, assignedTo: t.assignedTo ?? null, token, note: 'Guarda este token ahora en la terminal: no se puede volver a consultar. Al emitir uno nuevo, el anterior deja de funcionar.' });
   }),
 );
 
@@ -346,17 +360,30 @@ adminRouter.get(
   requirePerm('auditoria.ver'),
   ah(async (req, res) => {
     const me = sessionUser(req);
-    const q = parse(z.object({ entity: z.string().max(40).optional(), action: z.string().max(60).optional(), from: dayStr.optional(), to: dayStr.optional() }).merge(pageQuery(100, 500)), req.query);
+    const emptyToUndef = (v: unknown) => (typeof v === 'string' && v.trim() === '' ? undefined : v);
+    const q = parse(
+      z.object({
+        entity: z.preprocess(emptyToUndef, z.string().max(40).optional()),
+        action: z.preprocess(emptyToUndef, z.string().max(60).optional()),
+        from: z.preprocess(emptyToUndef, dayStr.optional()),
+        to: z.preprocess(emptyToUndef, dayStr.optional()),
+      }).merge(pageQuery(100, 500)),
+      req.query,
+    );
     const range = dayRangeIso(q.from, q.to);
     // Eventos de sus sucursales y eventos globales (sin sucursal).
     const filter: Record<string, unknown> = { branchId: { $in: [...me.branchIds, null] }, ...isoRangeFilter('at', range.from, range.to) };
-    if (q.entity) filter.entity = q.entity;
+    const entities = normalizeEntityFilter(q.entity);
+    if (entities) filter.entity = { $in: entities };
     if (q.action) filter.action = q.action;
-    const [total, items] = await Promise.all([
+    const [total, docs] = await Promise.all([
       col('audit_log').countDocuments(filter),
       col('audit_log').find(filter).sort({ at: -1 }).skip(q.offset).limit(q.limit).toArray(),
     ]);
-    res.json({ total, items: items.map((a) => out(a)) });
+    const ids = [...new Set(docs.map((d) => d.userId).filter((x): x is string => typeof x === 'string'))];
+    const users = ids.length ? await col('users').find({ _id: { $in: ids } as any }).project({ name: 1 }).toArray() : [];
+    const names = new Map(users.map((u) => [u._id as unknown as string, u.name as string]));
+    res.json({ total, items: docs.map((d) => auditView(d, names)) });
   }),
 );
 

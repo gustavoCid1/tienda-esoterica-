@@ -1,24 +1,35 @@
 /**
- * Caja (solo gerente): apertura con fondo, entradas / retiros / gastos, efectivo esperado en vivo,
- * corte con desglose de billetes y monedas, diferencia y historial de cortes.
+ * Caja. GERENTE: apertura con fondo (queda hora y monto), entradas / retiros / gastos, efectivo esperado en vivo,
+ * corte con desglose de billetes y monedas, diferencia, historial de cortes y TICKET DE CIERRE.
+ * VENDEDOR (v2): solo ve si la caja está abierta y puede CERRARLA A CIEGAS (sin esperado ni diferencia) con la
+ * contraseña de un administrador o un token. Cerrar SIEMPRE exige autorización.
  * El efectivo esperado = fondo + pagos en EFECTIVO (sin el cambio) + entradas - retiros - gastos
  * - devoluciones en efectivo. Tarjeta y transferencia NO entran al cajón.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { MXN_DENOMINATIONS, formatMXN } from '@amara/shared';
+import { MXN_DENOMINATIONS, can, formatMXN } from '@amara/shared';
 import type { CashBreakdown, CashMovementType, SalesSummary } from '@amara/shared';
-import type { CashClosureResult, ClosureRow } from '../../shared/ipc.ts';
+import type { CashClosureResult, CashStatus, ClosureRow, SensitiveAuth } from '../../shared/ipc.ts';
+import { AuthPrompt } from '../components/AuthPrompt.tsx';
+import { DocPreviewModal } from '../components/DocPreviewModal.tsx';
 import { Banner, Field } from '../components/Field.tsx';
 import { Modal } from '../components/Modal.tsx';
-import { call, errorText } from '../lib/api.ts';
+import { call, errorCode, errorText } from '../lib/api.ts';
 import { METHOD_LABEL, dateTime, money, parsePesos } from '../lib/format.ts';
+import { useApp } from '../state/AppState.tsx';
 import { useFeedback } from '../state/Feedback.tsx';
 import { useScanHandler } from '../state/Scanner.tsx';
 
-type View = { sessionId: string; openedAt: string; breakdown: CashBreakdown } | null;
+type View = { sessionId: string; openedAt: string; openedByName: string | null; breakdown: CashBreakdown } | null;
 
 export function CashScreen() {
+  const { user } = useApp();
+  return user && can(user.role, 'caja.corte') ? <ManagerCash /> : <SellerCash />;
+}
+
+function ManagerCash() {
   const { toast } = useFeedback();
+  const [ticketFor, setTicketFor] = useState<string | null>(null);
   const [view, setView] = useState<View | undefined>(undefined);
   const [closures, setClosures] = useState<ClosureRow[]>([]);
   const [summary, setSummary] = useState<{ summary: SalesSummary; pendingOps: number; mayBeIncomplete: boolean } | null>(null);
@@ -55,6 +66,8 @@ export function CashScreen() {
           <strong>Corte realizado.</strong> Esperado {money(result.expectedCents)} - Contado {money(result.countedCents)} -{' '}
           {result.differenceCents === 0 ? 'Sin diferencia.' : result.differenceCents < 0 ? `Faltante de ${money(-result.differenceCents)}.` : `Sobrante de ${money(result.differenceCents)}.`}
           {result.provisional && ' El corte es PROVISIONAL: hay operaciones sin sincronizar y se conciliará al conectar.'}
+          {result.authorizedByName && ` Autorizó: ${result.authorizedByName}.`}{' '}
+          <button className="btn btn-gold btn-sm" onClick={() => setTicketFor(result.sessionId)}>Generar ticket de cierre</button>
         </Banner>
       )}
 
@@ -72,7 +85,9 @@ export function CashScreen() {
             <div className="row-between">
               <div>
                 <h3>Caja abierta</h3>
-                <div className="muted">Desde {dateTime(view.openedAt)} - {b!.operations} operaciones</div>
+                <div className="muted">
+                  Abierta el {dateTime(view.openedAt)}{view.openedByName ? ` por ${view.openedByName}` : ''} con un fondo inicial de <strong>{money(b!.openingCents)}</strong> - {b!.operations} operaciones
+                </div>
               </div>
               <div className="stat">
                 <span className="muted">Efectivo que debe haber en el cajón</span>
@@ -123,7 +138,7 @@ export function CashScreen() {
       <div className="card">
         <h3>Cortes anteriores</h3>
         <table className="table">
-          <thead><tr><th>Cierre</th><th className="num">Esperado</th><th className="num">Contado</th><th className="num">Diferencia</th><th>Estado</th></tr></thead>
+          <thead><tr><th>Cierre</th><th className="num">Esperado</th><th className="num">Contado</th><th className="num">Diferencia</th><th>Estado</th><th /></tr></thead>
           <tbody>
             {closures.map((c) => (
               <tr key={c.id}>
@@ -132,9 +147,10 @@ export function CashScreen() {
                 <td className="num">{money(c.countedCents)}</td>
                 <td className={`num ${c.differenceCents < 0 ? 'neg' : ''}`}>{money(c.differenceCents)}</td>
                 <td className="muted">{c.provisional ? 'Provisional' : 'Definitivo'} - {c.reconciliation === 'conciliado' ? 'conciliado' : c.reconciliation === 'con_diferencias' ? 'con diferencias' : 'por conciliar'}</td>
+                <td className="num"><button className="btn btn-sm" onClick={() => setTicketFor(c.id)}>Ticket de cierre</button></td>
               </tr>
             ))}
-            {closures.length === 0 && <tr><td colSpan={5} className="center muted">Todavía no hay cortes.</td></tr>}
+            {closures.length === 0 && <tr><td colSpan={6} className="center muted">Todavía no hay cortes.</td></tr>}
           </tbody>
         </table>
       </div>
@@ -144,6 +160,51 @@ export function CashScreen() {
       {modal === 'close' && b && (
         <CloseModal expectedCents={b.expectedCents} onClose={() => setModal(null)} onDone={(r) => { setModal(null); setResult(r); void load(); }} />
       )}
+      {ticketFor && <DocPreviewModal doc={{ kind: 'closure', sessionId: ticketFor }} title="Ticket de cierre de caja" onClose={() => setTicketFor(null)} />}
+    </div>
+  );
+}
+
+/** Vendedor: ve la hora de apertura y puede cerrar la caja a ciegas, con autorización de administrador. */
+function SellerCash() {
+  const { toast } = useFeedback();
+  const [status, setStatus] = useState<CashStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [closing, setClosing] = useState(false);
+  const [done, setDone] = useState<CashClosureResult | null>(null);
+
+  useScanHandler(() => toast('info', 'En esta pantalla no se usa el escáner.'));
+  const load = useCallback(() => {
+    call('cash:status').then((s) => { setStatus(s); setError(null); }).catch((e) => setError(errorText(e)));
+  }, []);
+  useEffect(() => load(), [load]);
+
+  return (
+    <div className="page">
+      <h1>Caja</h1>
+      {error && <Banner kind="error">{error}</Banner>}
+      {done && (
+        <Banner kind="ok" onClose={() => setDone(null)}>
+          <strong>Caja cerrada.</strong> Autorizó: {done.authorizedByName ?? 'administrador'}. El gerente revisa el corte.
+          {done.provisional && ' El corte es provisional: hay operaciones sin sincronizar.'}
+        </Banner>
+      )}
+      {status === null ? (
+        <p className="muted">Cargando...</p>
+      ) : !status.open ? (
+        <div className="card">
+          <h3>La caja está cerrada</h3>
+          <p className="muted">Un gerente abre la caja con el fondo inicial para que se puedan registrar ventas.</p>
+        </div>
+      ) : (
+        <div className="card">
+          <h3>Caja abierta</h3>
+          <div className="muted">Abierta el {dateTime(status.openedAt!)}{status.openedByName ? ` por ${status.openedByName}` : ''}.</div>
+          <p className="muted">Para cerrarla cuenta el efectivo del cajón y pide a un administrador que escriba su contraseña (o usa un token de cierre de caja). No se muestran importes esperados.</p>
+          <button className="btn btn-gold btn-lg" onClick={() => setClosing(true)}>Cerrar caja</button>
+        </div>
+      )}
+      {closing && <CloseModal expectedCents={null} onClose={() => setClosing(false)} onDone={(r) => { setClosing(false); setDone(r); load(); }} />}
     </div>
   );
 }
@@ -215,12 +276,14 @@ function MoveModal({ type, onClose, onDone }: { type: CashMovementType; onClose:
   );
 }
 
-function CloseModal({ expectedCents, onClose, onDone }: { expectedCents: number; onClose: () => void; onDone: (r: CashClosureResult) => void }) {
+/** `expectedCents = null` = cierre a ciegas (vendedor): no se muestra esperado ni diferencia. */
+function CloseModal({ expectedCents, onClose, onDone }: { expectedCents: number | null; onClose: () => void; onDone: (r: CashClosureResult) => void }) {
   const [mode, setMode] = useState<'desglose' | 'total'>('desglose');
   const [counts, setCounts] = useState<Record<string, string>>({});
   const [totalText, setTotalText] = useState('');
   const [notes, setNotes] = useState('');
-  const [password, setPassword] = useState('');
+  const [auth, setAuth] = useState<SensitiveAuth | null>(null);
+  const [resetSignal, setResetSignal] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const submitting = useRef(false);
@@ -230,9 +293,9 @@ function CloseModal({ expectedCents, onClose, onDone }: { expectedCents: number;
   const fromCounts = labels.reduce((a, l) => a + (Number(counts[l] ?? 0) || 0) * MXN_DENOMINATIONS[l]!, 0);
   const totalParsed = parsePesos(totalText);
   const counted = mode === 'desglose' ? (invalidCount ? null : fromCounts) : totalParsed === null || Number.isNaN(totalParsed) ? null : totalParsed;
-  const diff = counted === null ? null : counted - expectedCents;
-  const dirty = Object.values(counts).some((v) => v) || totalText !== '' || notes !== '' || password !== '';
-  const ready = counted !== null && password.length > 0;
+  const diff = counted === null || expectedCents === null ? null : counted - expectedCents;
+  const dirty = Object.values(counts).some((v) => v) || totalText !== '' || notes !== '' || auth !== null;
+  const ready = counted !== null && auth !== null;
 
   const submit = async () => {
     if (submitting.current || !ready) return;
@@ -242,10 +305,10 @@ function CloseModal({ expectedCents, onClose, onDone }: { expectedCents: number;
     try {
       const denominations: Record<string, number> = {};
       if (mode === 'desglose') for (const l of labels) if (Number(counts[l] ?? 0) > 0) denominations[l] = Number(counts[l]);
-      onDone(await call('cash:close', { countedCents: counted as number, denominations, notes, password }));
+      onDone(await call('cash:close', { countedCents: counted as number, denominations, notes, ...auth }));
     } catch (e) {
       setError(errorText(e));
-      setPassword('');
+      if (['credenciales', 'autorizacion_requerida', 'autorizacion_invalida'].includes(errorCode(e))) setResetSignal((n) => n + 1);
       submitting.current = false;
       setBusy(false);
     }
@@ -273,18 +336,24 @@ function CloseModal({ expectedCents, onClose, onDone }: { expectedCents: number;
           <Field label="Efectivo contado ($)"><input className="inp inp-lg" inputMode="decimal" value={totalText} onChange={(e) => setTotalText(e.target.value)} /></Field>
         )}
         {invalidCount && <Banner kind="warn">Las cantidades de billetes y monedas deben ser números enteros.</Banner>}
-        <div className="stat-row">
-          <div><span className="muted">Esperado</span><div className="stat-big">{money(expectedCents)}</div></div>
-          <div><span className="muted">Contado</span><div className="stat-big">{counted === null ? '--' : money(counted)}</div></div>
-          <div>
-            <span className="muted">Diferencia</span>
-            <div className={`stat-big ${diff !== null && diff < 0 ? 'neg' : ''}`}>
-              {diff === null ? '--' : diff === 0 ? 'Sin diferencia' : diff < 0 ? `Faltan ${money(-diff)}` : `Sobran ${money(diff)}`}
+        {expectedCents === null ? (
+          <div className="stat-row">
+            <div><span className="muted">Contado</span><div className="stat-big">{counted === null ? '--' : money(counted)}</div></div>
+          </div>
+        ) : (
+          <div className="stat-row">
+            <div><span className="muted">Esperado</span><div className="stat-big">{money(expectedCents)}</div></div>
+            <div><span className="muted">Contado</span><div className="stat-big">{counted === null ? '--' : money(counted)}</div></div>
+            <div>
+              <span className="muted">Diferencia</span>
+              <div className={`stat-big ${diff !== null && diff < 0 ? 'neg' : ''}`}>
+                {diff === null ? '--' : diff === 0 ? 'Sin diferencia' : diff < 0 ? `Faltan ${money(-diff)}` : `Sobran ${money(diff)}`}
+              </div>
             </div>
           </div>
-        </div>
+        )}
         <Field label="Notas (opcional)"><input className="inp" value={notes} maxLength={300} onChange={(e) => setNotes(e.target.value)} /></Field>
-        <Field label="Tu contraseña (confirmación)"><input className="inp" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" /></Field>
+        <AuthPrompt purpose="cierre_caja" onChange={setAuth} resetSignal={resetSignal} disabled={busy} managerLabel="Tu contraseña (confirmación de cierre)" />
         {error && <Banner kind="error">{error}</Banner>}
       </div>
     </Modal>

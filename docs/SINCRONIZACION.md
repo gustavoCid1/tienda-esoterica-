@@ -102,6 +102,7 @@ Antes del detalle, cómo responde el servidor a cada operación (`applySyncOp`):
 | `caja_desconocida` / `caja_otra_sucursal` | La venta o ajuste apunta a una caja que el servidor no conoce o es de otra sucursal |
 | `venta_tras_corte` / `movimiento_tras_corte` | La operación es posterior al corte de su sesión de caja |
 | `importe_ajuste_distinto` / `pagos_no_coinciden` | En una devolución/cancelación, el importe o los pagos no cuadran con el recálculo |
+| `autorizacion_invalida` | **v2.** Un cierre de caja, cancelación, devolución o Limpia hecho por un vendedor trae una autorización que NO era válida a la hora local de la operación (token vencido/revocado/agotado/de otro propósito o sucursal, gerente inactivo o de otra sucursal, o token que se agotó en una carrera). La operación ya ocurrió: se aplica y se avisa |
 | `conteo_difiere` | Un conteo físico no coincide con la existencia del servidor (hubo operaciones entre medio) |
 | `caja_duplicada` | La terminal ya tenía otra caja abierta en el servidor |
 | `corte_difiere` | El efectivo esperado del dispositivo no coincide con el que calcula el servidor (faltan o sobran operaciones por sincronizar) |

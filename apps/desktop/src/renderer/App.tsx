@@ -8,17 +8,19 @@ import { ActivationScreen } from './screens/Activation.tsx';
 import { CashScreen } from './screens/Cash.tsx';
 import { InventoryScreen } from './screens/Inventory.tsx';
 import { LabelsScreen } from './screens/Labels.tsx';
+import { LimpiasScreen } from './screens/Limpias.tsx';
 import { LoginScreen } from './screens/Login.tsx';
 import { PosScreen } from './screens/Pos.tsx';
 import { SettingsScreen } from './screens/Settings.tsx';
 import { SyncScreen } from './screens/SyncScreen.tsx';
 import { TicketsScreen } from './screens/Tickets.tsx';
+import { TokensScreen } from './screens/Tokens.tsx';
 import { AppProvider, useApp } from './state/AppState.tsx';
 import { FeedbackProvider, useFeedback } from './state/Feedback.tsx';
 import { PosProvider, usePos } from './state/PosState.tsx';
 import { ScannerProvider } from './state/Scanner.tsx';
 
-type ScreenId = 'pos' | 'tickets' | 'cash' | 'inventory' | 'labels' | 'sync' | 'settings';
+type ScreenId = 'pos' | 'tickets' | 'cash' | 'limpias' | 'inventory' | 'labels' | 'tokens' | 'sync' | 'settings';
 
 interface NavItem {
   id: ScreenId;
@@ -54,9 +56,13 @@ function Shell() {
   const nav: NavItem[] = [
     { id: 'pos', label: 'Vender', perm: 'ventas.crear' },
     { id: 'tickets', label: isManager ? 'Tickets' : 'Mis tickets', perm: 'ventas.ver_propias' },
-    { id: 'cash', label: 'Caja', perm: 'caja.corte' },
+    // v2: el vendedor también entra a Caja, pero SOLO para cerrarla a ciegas con autorización de administrador.
+    { id: 'cash', label: 'Caja', perm: 'ventas.crear' },
+    // v2: Limpias. El gerente entra libre; el vendedor pide contraseña de administrador o token dentro de la pantalla.
+    { id: 'limpias', label: 'Limpias', perm: 'ventas.crear' },
     { id: 'inventory', label: 'Inventario', perm: 'inventario.ver' },
     { id: 'labels', label: 'Etiquetas', perm: 'productos.ver' },
+    { id: 'tokens', label: 'Tokens', perm: 'config.editar' },
     { id: 'sync', label: 'Sincronización', perm: 'sync.estado' },
     { id: 'settings', label: 'Ajustes', perm: 'config.editar' },
   ];
@@ -111,8 +117,10 @@ function Shell() {
           {current === 'pos' && <PosScreen />}
           {current === 'tickets' && <TicketsScreen />}
           {current === 'cash' && <CashScreen />}
+          {current === 'limpias' && <LimpiasScreen />}
           {current === 'inventory' && <InventoryScreen goLabels={() => setScreen('labels')} />}
           {current === 'labels' && <LabelsScreen />}
+          {current === 'tokens' && <TokensScreen />}
           {current === 'sync' && <SyncScreen />}
           {current === 'settings' && <SettingsScreen />}
         </main>

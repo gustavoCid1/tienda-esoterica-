@@ -6,14 +6,30 @@ import { centsToInput, formatMXN, parseMoneyInput } from '../lib/format.ts';
 import { computeReturnAmount, validateReturn, type ReturnSelection } from '../lib/ops.ts';
 import { mxTodayKey } from '../lib/dates.ts';
 import type { AdminUser, Terminal } from '../lib/types.ts';
+import type { SaleV2 } from '../lib/types-v2.ts';
+import { SALE_TYPE_LABEL, extraLineLabel, filterSalesByType, isExtraLine, saleTypeOf, sellerLabel, type SaleTypeFilter } from '../lib/salesV2.ts';
 import { Alert, Badge, Card, Empty, ErrorBox, Field, Modal, PageHeader, Spinner, TableWrap, CloseButton } from '../components/ui.tsx';
 import { BranchSelect, DateRangeBar } from '../components/common.tsx';
 import { useAuth, useBranches, useToast } from '../context.tsx';
 
 const METHOD_LABEL: Record<PaymentMethod, string> = { efectivo: 'Efectivo', tarjeta: 'Tarjeta', transferencia: 'Transferencia', otro: 'Otro' };
 
-export function Sales() {
+/** Historial de Limpias: el mismo archivo de tickets, ya filtrado por tipo 'limpia'. */
+export function LimpiasHistory() {
+  return (
+    <Sales
+      initialType="limpia"
+      title="Historial de Limpias"
+      subtitle="Limpias registradas desde escritorio o móvil. Cada una conserva quién la realizó y su ticket."
+    />
+  );
+}
+
+export function Sales(props: { initialType?: SaleTypeFilter; title?: string; subtitle?: string } = {}) {
   const { branchName } = useBranches();
+  const { user } = useAuth();
+  const isManager = user?.role === 'gerente';
+  const [type, setType] = useState<SaleTypeFilter>(props.initialType ?? '');
   const today = mxTodayKey();
   const [range, setRange] = useState({ from: today, to: today });
   const [branchId, setBranchId] = useState('');
@@ -32,18 +48,22 @@ export function Sales() {
   const res = useAsync(
     (signal) =>
       api
-        .get<unknown>('/sales', { from: range.from, to: range.to, branchId, status, folio: dfolio, userId, terminalId }, signal)
-        .then((d) => asList<Sale>(d)),
-    [range.from, range.to, branchId, status, dfolio, userId, terminalId],
+        .get<unknown>('/sales', { from: range.from, to: range.to, branchId, status, folio: dfolio, userId, terminalId, type }, signal)
+        .then((d) => asList<SaleV2>(d)),
+    [range.from, range.to, branchId, status, dfolio, userId, terminalId, type],
     valid,
   );
-  const rows = res.data ?? [];
+  // El filtro por tipo también se aplica aquí: si el servidor ignora el parámetro, la lista sigue correcta.
+  const rows = useMemo(() => filterSalesByType(res.data ?? [], type), [res.data, type]);
   const sumCompleted = useMemo(() => rows.filter((s) => s.status === 'completada').reduce((a, s) => a + s.totalCents, 0), [rows]);
   const termName = (id: string) => terminals.data?.find((t) => t.id === id)?.name ?? id.slice(0, 6);
 
   return (
     <>
-      <PageHeader title="Ventas y archivo de tickets" subtitle="Consulta tickets por fecha con sus precios originales. Cancelar o devolver crea un ajuste: la venta nunca se borra." />
+      <PageHeader
+        title={props.title ?? 'Ventas y archivo de tickets'}
+        subtitle={props.subtitle ?? 'Consulta tickets por fecha con sus precios originales. Cancelar o devolver crea un ajuste: la venta nunca se borra.'}
+      />
       <div className="filters">
         <DateRangeBar from={range.from} to={range.to} onChange={(from, to) => setRange({ from, to })} />
         <label className="inline-field">
@@ -56,6 +76,14 @@ export function Sales() {
             <option value="">Todos</option>
             <option value="completada">Completadas</option>
             <option value="cancelada">Canceladas</option>
+          </select>
+        </label>
+        <label className="inline-field">
+          <span>Tipo</span>
+          <select value={type} onChange={(e) => setType(e.target.value as SaleTypeFilter)}>
+            <option value="">Ventas y Limpias</option>
+            <option value="venta">Solo ventas</option>
+            <option value="limpia">Solo Limpias</option>
           </select>
         </label>
         <label className="inline-field">
@@ -91,16 +119,18 @@ export function Sales() {
             <TableWrap>
               <table className="table">
                 <thead>
-                  <tr><th>Folio</th><th>Fecha</th><th>Sucursal</th><th>Terminal</th><th>Vendedor</th><th className="num">Total</th><th>Estado</th><th /></tr>
+                  <tr><th>Folio</th><th>Fecha</th><th>Tipo</th><th>Sucursal</th><th>Terminal</th><th>Vendedor</th>{isManager && <th>Vendió</th>}<th className="num">Total</th><th>Estado</th><th /></tr>
                 </thead>
                 <tbody>
                   {rows.map((s) => (
                     <tr key={s.id}>
                       <td><strong>{s.folio}</strong></td>
                       <td>{formatMxDateTime(s.createdAt)}</td>
+                      <td>{saleTypeOf(s) === 'limpia' ? <Badge tone="gold">Limpia</Badge> : <span className="muted">Venta</span>}</td>
                       <td>{branchName(s.branchId)}</td>
                       <td>{termName(s.terminalId)}</td>
                       <td>{s.userName}</td>
+                      {isManager && <td>{sellerLabel(s, true) ?? <span className="muted">-</span>}</td>}
                       <td className="num strong">{formatMXN(s.totalCents)}</td>
                       <td>{s.status === 'cancelada' ? <Badge tone="danger">Cancelada</Badge> : <Badge tone="ok">Completada</Badge>}</td>
                       <td className="row-actions"><button type="button" className="btn btn-sm" onClick={() => setOpenId(s.id)}>Ver detalle</button></td>
@@ -117,10 +147,11 @@ export function Sales() {
   );
 }
 
-type DetailSale = Sale & { adjustments?: SaleAdjustment[] };
+type DetailSale = SaleV2 & { adjustments?: SaleAdjustment[] };
 
 function SaleDetail({ id, onClose, onChanged }: { id: string; onClose: () => void; onChanged: () => void }) {
-  const { can } = useAuth();
+  const { can, user } = useAuth();
+  const isManager = user?.role === 'gerente';
   const { branchName } = useBranches();
   const res = useAsync((s) => api.get<DetailSale>(`/sales/${id}`, undefined, s), [id]);
   const [action, setAction] = useState<'cancel' | 'return' | null>(null);
@@ -143,6 +174,8 @@ function SaleDetail({ id, onClose, onChanged }: { id: string; onClose: () => voi
               <div><span className="muted small">Fecha</span><div>{formatMxDateTime(sale.createdAt)}</div></div>
               <div><span className="muted small">Sucursal</span><div>{branchName(sale.branchId)}</div></div>
               <div><span className="muted small">Vendedor</span><div>{sale.userName}</div></div>
+              {sellerLabel(sale, isManager) && <div><span className="muted small">Vendió</span><div>{sellerLabel(sale, isManager)}</div></div>}
+              <div><span className="muted small">Tipo</span><div>{saleTypeOf(sale) === 'limpia' ? <Badge tone="gold">{SALE_TYPE_LABEL.limpia}</Badge> : SALE_TYPE_LABEL.venta}</div></div>
               <div><span className="muted small">Estado</span><div>{sale.status === 'cancelada' ? <Badge tone="danger">Cancelada</Badge> : <Badge tone="ok">Completada</Badge>}</div></div>
             </div>
             <TableWrap>
@@ -153,7 +186,10 @@ function SaleDetail({ id, onClose, onChanged }: { id: string; onClose: () => voi
                 <tbody>
                   {sale.items.map((it) => (
                     <tr key={it.id}>
-                      <td>{it.productName} <span className="muted">{it.variantLabel}</span></td>
+                      <td>
+                        {it.productName} <span className="muted">{it.variantLabel}</span>
+                        {isExtraLine(it) && <> <Badge tone="info">{extraLineLabel(it)}</Badge></>}
+                      </td>
                       <td className="small">{it.sku || it.code}</td>
                       <td className="num">{it.qty}</td>
                       <td className="num">{formatMXN(it.unitPriceCents)}</td>

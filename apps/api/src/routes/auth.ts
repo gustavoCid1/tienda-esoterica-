@@ -31,7 +31,7 @@ let dummyHash: string | undefined;
  * respuesta tarde lo mismo y no se pueda averiguar qué usuarios existen. (scrypt es síncrono: el
  * límite de tasa evita que se use para saturar el servidor.)
  */
-function checkPassword(user: { passwordHash?: string } | null, password: string): boolean {
+export function checkPassword(user: { passwordHash?: string } | null, password: string): boolean {
   if (!user?.passwordHash) {
     dummyHash ??= hashPassword('contrasena-ficticia-0000');
     verifyPassword(password, dummyHash);

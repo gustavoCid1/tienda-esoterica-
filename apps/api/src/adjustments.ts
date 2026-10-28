@@ -52,7 +52,9 @@ export function buildCancellation(sale: Sale, priors: SaleAdjustment[], p: Base)
     reason, amountCents: sale.totalCents, payments: sale.payments.map((x) => ({ method: x.method, amountCents: x.amountCents })),
     items: sale.items.map((i) => ({
       saleItemId: i.id, variantId: i.variantId, productName: i.productName, variantLabel: i.variantLabel, qty: i.qty,
-      unitCostCents: i.unitCostCents, netCents: i.netCents, restock: true,
+      unitCostCents: i.unitCostCents, netCents: i.netCents,
+      // Un extra no movió inventario: al cancelar se devuelve el dinero, no existencias.
+      restock: i.kind !== 'extra', kind: i.kind === 'extra' ? 'extra' : 'producto',
     })),
     cashSessionId: p.cashSessionId,
   };
@@ -81,7 +83,8 @@ export function buildReturn(
     amount += refund;
     items.push({
       saleItemId: line.id, variantId: line.variantId, productName: line.productName, variantLabel: line.variantLabel, qty: l.qty,
-      unitCostCents: line.unitCostCents, netCents: refund, restock: l.restock,
+      unitCostCents: line.unitCostCents, netCents: refund,
+      restock: line.kind === 'extra' ? false : l.restock, kind: line.kind === 'extra' ? 'extra' : 'producto',
     });
   }
   if (items.length === 0 || amount <= 0) throw new AdjustmentError(400, 'sin_partidas', 'No hay partidas por devolver');

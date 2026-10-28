@@ -11,6 +11,7 @@ import { Banner, Field } from '../components/Field.tsx';
 import { MovementModal, NewProductModal } from '../components/InventoryModals.tsx';
 import type { InvPerms } from '../components/InventoryModals.tsx';
 import { call, errorText } from '../lib/api.ts';
+import { stockView } from '../lib/cart.ts';
 import { money } from '../lib/format.ts';
 import { useApp } from '../state/AppState.tsx';
 import { useFeedback } from '../state/Feedback.tsx';
@@ -100,13 +101,17 @@ export function InventoryScreen({ goLabels }: { goLabels: () => void }) {
           </tr>
         </thead>
         <tbody>
-          {rows.map((h) => (
+          {rows.map((h) => {
+            const sv = stockView(h.qty);
+            return (
             <tr key={h.variantId}>
               <td><div className="cell-main">{h.productName}</div><div className="muted small">{h.category}</div></td>
               <td>{h.label}</td>
               <td className="mono small">{h.barcode ?? h.internalCode}</td>
               <td>{h.location ?? '-'}</td>
-              <td className={`num strong ${h.qty <= 0 ? 'neg' : h.qty <= h.minStock ? 'warn-text' : ''}`}>{h.qty}{h.qty <= 0 ? ' (agotado)' : h.qty <= h.minStock ? ' (poca)' : ''}</td>
+              <td className={`num strong ${sv.soldOut ? 'neg' : h.qty <= h.minStock ? 'warn-text' : ''}`}>
+                {sv.shown}{sv.inherited ? ' (existencia por corregir)' : sv.soldOut ? ' (sin existencia)' : h.qty <= h.minStock ? ' (poca)' : ''}
+              </td>
               <td className="num">{money(h.priceCents)}</td>
               {isManager && <td className="num">{money(h.costCents)}</td>}
               <td className="num">
@@ -116,7 +121,9 @@ export function InventoryScreen({ goLabels }: { goLabels: () => void }) {
                 </div>
               </td>
             </tr>
-          ))}
+          
+            );
+          })}
           {rows.length === 0 && !loading && <tr><td colSpan={isManager ? 8 : 7} className="center muted">No hay productos con ese filtro.</td></tr>}
         </tbody>
       </table>

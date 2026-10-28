@@ -1,6 +1,7 @@
 /** Lógica pura del tablero: indicadores personalizables, datos de gráficas y normalización de respuestas. */
 import type { MonthTotal, ProductRank, SalesSummary } from '@amara/shared';
 import { monthLabel } from './format.ts';
+import { parseChartKind } from './series.ts';
 import type { CashSessionRow, DashboardExtra, DashboardPrefs, InventoryRow } from './types.ts';
 
 export interface WidgetDef {
@@ -23,6 +24,7 @@ export const WIDGETS: WidgetDef[] = [
   { id: 'best_month', title: 'Mes con mayor importe', span: 1 },
   { id: 'cash', title: 'Efectivo en cortes del período', span: 2 },
   { id: 'by_branch', title: 'Ventas por sucursal', span: 2 },
+  { id: 'top_series', title: 'Productos más vendidos por día o mes', span: 2 },
   { id: 'top_units', title: 'Productos más vendidos (unidades)', span: 2 },
   { id: 'top_revenue', title: 'Productos con mayores ingresos', span: 2 },
   { id: 'months', title: 'Ingresos por mes', span: 2 },
@@ -32,14 +34,21 @@ export const WIDGETS: WidgetDef[] = [
 
 export const DEFAULT_PREFS: DashboardPrefs = { order: WIDGETS.map((w) => w.id), hidden: [] };
 
-/** Acepta cualquier cosa que devuelva el servidor y produce preferencias bien formadas. */
+/**
+ * Acepta cualquier cosa que devuelva el servidor y produce preferencias bien formadas.
+ * GET /prefs/dashboard responde `{ prefs: {...}, updatedAt }`; también se acepta el objeto directo.
+ * `chartKind` (v2) solo se conserva si es un tipo válido.
+ */
 export function normalizePrefs(raw: unknown): DashboardPrefs {
   const known = new Set(WIDGETS.map((w) => w.id));
-  const o = (raw && typeof raw === 'object' ? raw : {}) as { order?: unknown; hidden?: unknown };
+  const root = (raw && typeof raw === 'object' ? raw : {}) as { prefs?: unknown };
+  const inner = root.prefs && typeof root.prefs === 'object' ? root.prefs : root;
+  const o = inner as { order?: unknown; hidden?: unknown; chartKind?: unknown };
   const strings = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && known.has(x)) : []);
   const order = [...new Set(strings(o.order))];
   const hidden = [...new Set(strings(o.hidden))];
-  return { order, hidden };
+  const kind = parseChartKind(o.chartKind);
+  return kind ? { order, hidden, chartKind: kind } : { order, hidden };
 }
 
 export interface ResolvedWidget {

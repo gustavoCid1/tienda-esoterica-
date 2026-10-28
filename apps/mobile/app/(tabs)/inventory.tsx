@@ -11,6 +11,7 @@ import type { CatalogHit } from '@amara/database';
 import { Banner, Button, Chip, ChipRow, H2, Loading, Muted, P, Row } from '../../src/components/ui';
 import { StatusBanner } from '../../src/components/StatusBanner';
 import { MovementModal } from '../../src/components/MovementModal';
+import { isLegacyNegative, shownQty } from '../../src/lib/low-stock';
 import { useApp } from '../../src/state/AppContext';
 import { useCart } from '../../src/state/CartContext';
 import { colors, radius, space } from '../../src/theme';
@@ -110,7 +111,8 @@ export default function Inventory() {
                 <H2>{selected.productName}</H2>
                 <P>{selected.label}</P>
                 <Row label="Precio" value={formatMXN(selected.priceCents)} strong />
-                <Row label="Existencia (local)" value={String(selected.qty)} strong valueColor={selected.qty <= 0 ? colors.danger : undefined} />
+                <Row label="Existencia (local)" value={String(shownQty(selected.qty))} strong valueColor={selected.qty <= 0 ? colors.danger : undefined} />
+                {isLegacyNegative(selected.qty) ? <Banner kind="warn" text="Existencia por corregir: el inventario tiene un descuadre heredado. Avisa al gerente para ajustarlo." /> : null}
                 <Row label="Mínimo" value={String(selected.minStock)} />
                 <Row label="Sucursal" value={app.myBranches.find((b) => b.id === device.branchId)?.name ?? ''} />
                 <Row label="Lugar" value={selected.location ?? 'Sin lugar'} />
@@ -119,11 +121,23 @@ export default function Inventory() {
                 <Row label="Código de barras" value={selected.barcode ?? 'No tiene'} />
                 {app.can('ventas.crear') ? (
                   <Button
-                    title="Agregar a la venta"
+                    title={selected.qty <= 0 ? 'Sin existencia' : 'Agregar a la venta'}
+                    disabled={selected.qty <= 0}
                     onPress={() => {
-                      cart.add(selected, 1);
-                      setNotice(`Agregado al carrito: ${selected.productName} ${selected.label}`);
+                      const blocked = cart.add(selected, 1);
+                      setNotice(blocked ?? `Agregado al carrito: ${selected.productName} ${selected.label}`);
                       setSelected(null);
+                    }}
+                  />
+                ) : null}
+                {app.can('estadisticas.ver') ? (
+                  <Button
+                    title="Ventas del producto"
+                    variant="secondary"
+                    onPress={() => {
+                      const hit = selected;
+                      setSelected(null);
+                      router.push({ pathname: '/product-sales', params: { productId: hit.productId, name: hit.productName } });
                     }}
                   />
                 ) : null}
@@ -179,8 +193,8 @@ function ItemRow({ item, onPress }: { item: CatalogHit; onPress: () => void }) {
         <Text style={styles.itemSub}>{formatMXN(item.priceCents)}</Text>
       </View>
       <View style={[styles.qty, out && styles.qtyOut, low && styles.qtyLow]}>
-        <Text style={[styles.qtyNum, out && { color: colors.danger }]}>{item.qty}</Text>
-        <Text style={styles.qtyLabel}>{out ? 'Agotado' : low ? 'Bajo' : 'pzas'}</Text>
+        <Text style={[styles.qtyNum, out && { color: colors.danger }]}>{shownQty(item.qty)}</Text>
+        <Text style={styles.qtyLabel}>{isLegacyNegative(item.qty) ? 'Por corregir' : out ? 'Agotado' : low ? 'Bajo' : 'pzas'}</Text>
       </View>
     </Pressable>
   );

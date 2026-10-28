@@ -6,20 +6,28 @@
  * Solo después del COMMIT se le informa al operador que la venta quedó guardada.
  */
 import {
+  DEFAULT_EXTRA_CATEGORIES,
   buildFolio,
   can,
   cashDifference,
   computeCashBreakdown,
   computeSale,
   isGrantActive,
+  isTokenActive,
+  mxDayBounds,
   mxDayKey,
   newId,
   parseQrValue,
   refundAmountForLine,
+  sanitizeExtraCategories,
   summarizeSales,
+  tokenDenyMessage,
+  verifyTokenCodeLocal,
 } from '@amara/shared';
 import type {
+  ActionAuthorization,
   AdjustmentItem,
+  CachedSecurityToken,
   CashMovementType,
   Grant,
   PaymentInput,
@@ -29,9 +37,13 @@ import type {
   SalesSummary,
   Sale,
   SaleAdjustment,
+  SaleItemKind,
   SaleLineInput,
+  SaleType,
   SyncOp,
   SyncResult,
+  TodaySaleSummary,
+  TokenPurpose,
 } from '@amara/shared';
 import type { Db, RawDb } from './db.ts';
 import { MIGRATIONS } from './schema.ts';
@@ -62,31 +74,96 @@ const HIT_SELECT = `
   JOIN products p ON p.id = v.product_id
   LEFT JOIN stock st ON st.variant_id = v.id AND st.branch_id = ?`;
 
+/** Línea de venta de entrada. Un 'extra' lleva el cargo en `unitPriceCents`, qty = 1 y una nota. */
+export interface RegisterSaleItem {
+  variantId: string;
+  qty: number;
+  lineDiscountCents?: number;
+  /** v2. Por omisión 'producto' (precio y costo salen del catálogo local). */
+  kind?: SaleItemKind;
+  /** v2. SOLO para 'extra': cargo adicional en centavos (≥ 0). En un producto se ignora. */
+  unitPriceCents?: number;
+  /** v2. SOLO para 'extra': qué se cobró. */
+  extraNote?: string | null;
+}
+
 export interface RegisterSaleInput {
   /** Se genera en la pantalla ANTES de cobrar: reintentar con el mismo id nunca duplica. */
   saleId: string;
   actor: Actor;
   branchId: string;
   terminalId: string;
-  items: { variantId: string; qty: number; lineDiscountCents?: number }[];
+  items: RegisterSaleItem[];
   discountCents?: number;
   payments: PaymentInput[];
+  /** v2. Empleado que vendió (elegido en la ventana de cobro). Si falta el nombre, se busca en los usuarios locales. */
+  sellerId?: string | null;
+  /** v2. SOLO en sistema: no se imprime en el ticket. */
+  sellerName?: string | null;
+  /** v2. 'venta' por omisión. Una 'limpia' hecha por un vendedor exige `authorization` con propósito 'limpias'. */
+  type?: SaleType;
+  /** v2. Autorización de la acción (Limpias de un vendedor). */
+  authorization?: ActionAuthorization;
+  /** v2. true si el servidor ya validó esta autorización en línea hace instantes (el token puede no estar en la caché). */
+  authorizationTrusted?: boolean;
 }
 
 export interface RegisterSaleResult {
   sale: Sale;
   duplicate: boolean;
-  /** Productos que quedaron con existencia local negativa (el stock puede estar desactualizado). */
+  /** Se conserva por compatibilidad. v2: las ventas nuevas ya no dejan existencias negativas, así que va vacío. */
   warnings: string[];
+}
+
+/** v2. Verificador de contraseña inyectable (por omisión, scrypt de @amara/shared/password). */
+export type PasswordVerifier = (password: string, stored: string) => boolean | Promise<boolean>;
+
+async function defaultVerifyPassword(password: string, stored: string): Promise<boolean> {
+  // Carga perezosa: solo se necesita al validar contraseñas de administrador (y arrastra @noble/hashes).
+  const m = await import('@amara/shared/password');
+  return m.verifyPassword(password, stored);
+}
+
+export interface VerifyAuthorizationInput {
+  /** Código del token (cualquier combinación de mayúsculas/minúsculas, con o sin guiones). */
+  code?: string;
+  /** Contraseña de un gerente activo de la sucursal. Se compara con el verificador local; no se guarda. */
+  adminPassword?: string;
+  /** Si se conoce quién es el gerente; si no, se prueba contra los gerentes de la sucursal. */
+  adminUserId?: string;
+  purpose: TokenPurpose;
+  branchId: string;
+  /** Usuario que realizará la acción (para tokens "solo para ese usuario"). */
+  userId?: string;
+}
+
+export type VerifyAuthorizationResult =
+  | {
+      ok: true;
+      authorization: ActionAuthorization;
+      /** Gerente que autorizó (o quien creó el token). */
+      authorizedBy: string | null;
+      authorizedByName: string | null;
+      expiresAt: string | null;
+      tokenLabel: string | null;
+    }
+  | { ok: false; reason: string; message: string };
+
+/** v2. Resultado de una verificación de autorización a nivel de operación. */
+interface ResolvedAuthorization {
+  authorization: ActionAuthorization;
+  authorizedBy: string | null;
 }
 
 export class LocalStore {
   db: Db;
   private clock: () => Date;
+  private verifyPw: PasswordVerifier;
 
-  constructor(db: Db, opts: { now?: () => Date } = {}) {
+  constructor(db: Db, opts: { now?: () => Date; verifyPassword?: PasswordVerifier } = {}) {
     this.db = db;
     this.clock = opts.now ?? (() => new Date());
+    this.verifyPw = opts.verifyPassword ?? defaultVerifyPassword;
   }
 
   nowIso(): string {
@@ -190,11 +267,13 @@ export class LocalStore {
         );
       }
       for (const u of p.users) {
+        // v2: `verifier` (solo gerentes) permite validar su contraseña sin internet; si no viene, se conserva el anterior.
         await tx.run(
-          `INSERT INTO users_local (id, username, name, role, branch_ids_json, active, updated_at) VALUES (?,?,?,?,?,?,?)
+          `INSERT INTO users_local (id, username, name, role, branch_ids_json, active, verifier, updated_at) VALUES (?,?,?,?,?,?,?,?)
            ON CONFLICT(id) DO UPDATE SET username = excluded.username, name = excluded.name, role = excluded.role,
-             branch_ids_json = excluded.branch_ids_json, active = excluded.active, updated_at = excluded.updated_at`,
-          [u.id, u.username, u.name, u.role, j(u.branchIds), u.active ? 1 : 0, p.serverTime],
+             branch_ids_json = excluded.branch_ids_json, active = excluded.active,
+             verifier = COALESCE(excluded.verifier, users_local.verifier), updated_at = excluded.updated_at`,
+          [u.id, u.username, u.name, u.role, j(u.branchIds), u.active ? 1 : 0, u.verifier ?? null, p.serverTime],
         );
       }
       for (const g of p.grants) {
@@ -204,6 +283,24 @@ export class LocalStore {
            ON CONFLICT(id) DO UPDATE SET functions_json = excluded.functions_json, starts_at = excluded.starts_at,
              expires_at = excluded.expires_at, revoked_at = excluded.revoked_at, fetched_at = excluded.fetched_at`,
           [g.id, g.sellerId, g.branchId, j(g.functions), g.startsAt, g.expiresAt, g.revokedAt, g.grantedBy, p.serverTime],
+        );
+      }
+      if (p.securityTokens) {
+        // La caché de tokens es una copia del servidor: se reemplaza completa (así un token revocado o vencido desaparece/actualiza).
+        await tx.run('DELETE FROM security_tokens_cache');
+        for (const t of p.securityTokens) {
+          await tx.run(
+            `INSERT INTO security_tokens_cache (id, label, hash, salt, purposes, branch_id, for_user_id, created_by, created_at, expires_at, revoked_at, max_uses, used_count, fetched_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [t.id, t.label ?? '', t.hash, t.salt, j(t.purposes ?? []), t.branchId ?? null, t.forUserId ?? null, t.createdBy ?? null, t.createdAt ?? null,
+              t.expiresAt, t.revokedAt ?? null, t.maxUses ?? null, t.usedCount ?? 0, p.serverTime],
+          );
+        }
+      }
+      if (p.settings?.extraCategories) {
+        await tx.run(
+          'INSERT INTO app_settings (key, value, updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',
+          ['extraCategories', j(sanitizeExtraCategories(p.settings.extraCategories)), p.serverTime],
         );
       }
       await tx.run("INSERT INTO meta (key, value) VALUES ('last_pull_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [p.serverTime]);
@@ -220,6 +317,166 @@ export class LocalStore {
     const r = await this.db.get<any>('SELECT * FROM users_local WHERE username = ? AND active = 1', [username]);
     if (!r) return undefined;
     return { id: r.id as string, username: r.username as string, name: r.name as string, role: r.role as Actor['role'], branchIds: parse<string[]>(r.branch_ids_json, []), verifier: r.verifier as string | null };
+  }
+
+  // ───────────────────────── v2: configuración y autorizaciones ─────────────────────────
+
+  async getSetting<T>(key: string, fallback: T): Promise<T> {
+    const r = await this.db.get<{ value: string }>('SELECT value FROM app_settings WHERE key = ?', [key]);
+    return parse<T>(r?.value, fallback);
+  }
+
+  /** Categorías con botón Extra (las del servidor; por omisión Veladoras, Pulseras, Imágenes, Lociones). */
+  async getExtraCategories(): Promise<string[]> {
+    const list = await this.getSetting<unknown>('extraCategories', null);
+    return Array.isArray(list) ? list.map(String) : [...DEFAULT_EXTRA_CATEGORIES];
+  }
+
+  async getSettings(): Promise<{ extraCategories: string[] }> {
+    return { extraCategories: await this.getExtraCategories() };
+  }
+
+  private rowToToken(r: any): CachedSecurityToken {
+    return {
+      id: r.id, label: r.label ?? '', purposes: parse<TokenPurpose[]>(r.purposes, []), branchId: r.branch_id ?? null, forUserId: r.for_user_id ?? null,
+      createdBy: r.created_by ?? '', createdAt: r.created_at ?? '', expiresAt: r.expires_at, revokedAt: r.revoked_at ?? null,
+      maxUses: r.max_uses ?? null, usedCount: r.used_count ?? 0, salt: r.salt, hash: r.hash,
+    };
+  }
+
+  /** Tokens descargados en el último pull (solo hashes; el código nunca llega al dispositivo). */
+  async listCachedTokens(): Promise<CachedSecurityToken[]> {
+    return (await this.db.all<any>('SELECT * FROM security_tokens_cache ORDER BY expires_at DESC')).map((r) => this.rowToToken(r));
+  }
+
+  /**
+   * Usos de un token que este dispositivo ya hizo pero el servidor aún no refleja en `used_count`:
+   * operaciones pendientes y las confirmadas después de bajar la caché.
+   */
+  private async pendingTokenUses(db: RawDb, tokenId: string): Promise<number> {
+    const r = await db.get<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM sync_queue WHERE instr(payload_json, ?) > 0
+         AND (status = 'pendiente' OR (status IN ('enviada','conflicto') AND received_at > COALESCE((SELECT MAX(fetched_at) FROM security_tokens_cache), '')))`,
+      [`"tokenId":"${tokenId}"`],
+    );
+    return r?.n ?? 0;
+  }
+
+  private async userName(db: RawDb, id: string | null | undefined): Promise<string | null> {
+    if (!id) return null;
+    return (await db.get<{ name: string }>('SELECT name FROM users_local WHERE id = ?', [id]))?.name ?? null;
+  }
+
+  /**
+   * Comprueba SIN conexión un código de token o la contraseña de un gerente.
+   * - Token: contra los hashes descargados (vigencia, propósito, sucursal, usuario, revocación y máximo de usos,
+   *   descontando los usos locales aún no confirmados).
+   * - Contraseña: contra los verificadores de los gerentes de la sucursal bajados en el último pull.
+   * Si no puede comprobarlo, DENIEGA. Nunca guarda la contraseña ni el código.
+   * Devuelve la `authorization` que debe pasarse a closeCash / cancelSale / refundSale / registerSale.
+   */
+  async verifyActionAuthorization(input: VerifyAuthorizationInput): Promise<VerifyAuthorizationResult> {
+    const at = this.nowIso();
+    const hasCode = typeof input.code === 'string' && input.code.trim() !== '';
+    const hasPassword = typeof input.adminPassword === 'string' && input.adminPassword !== '';
+    if (!hasCode && !hasPassword) {
+      return { ok: false, reason: 'datos_faltantes', message: 'Escribe el código del token o la contraseña de un administrador' };
+    }
+
+    if (hasCode) {
+      const cached = await this.listCachedTokens();
+      const withUses: CachedSecurityToken[] = [];
+      for (const t of cached) withUses.push(t.maxUses === null ? t : { ...t, usedCount: t.usedCount + (await this.pendingTokenUses(this.db, t.id)) });
+      const r = verifyTokenCodeLocal(input.code!, withUses, input.purpose, input.branchId, at, input.userId);
+      if (r.ok) {
+        return {
+          ok: true, authorization: { kind: 'token', tokenId: r.token.id }, authorizedBy: r.token.createdBy || null,
+          authorizedByName: await this.userName(this.db, r.token.createdBy), expiresAt: r.token.expiresAt, tokenLabel: r.token.label || null,
+        };
+      }
+      if (!hasPassword) return { ok: false, reason: r.reason, message: tokenDenyMessage(r.reason) };
+    }
+
+    const rows = input.adminUserId
+      ? await this.db.all<any>("SELECT * FROM users_local WHERE id = ? AND active = 1 AND role = 'gerente'", [input.adminUserId])
+      : await this.db.all<any>("SELECT * FROM users_local WHERE active = 1 AND role = 'gerente'");
+    const admins = rows.filter((u) => parse<string[]>(u.branch_ids_json, []).includes(input.branchId));
+    if (admins.length === 0) return { ok: false, reason: 'sin_administrador', message: 'No hay un administrador activo de esta sucursal en este dispositivo' };
+    const withVerifier = admins.filter((u) => !!u.verifier);
+    if (withVerifier.length === 0) {
+      return { ok: false, reason: 'sin_verificador', message: 'Este dispositivo aún no puede validar la contraseña sin internet. Conéctate una vez para descargarla.' };
+    }
+    for (const u of withVerifier) {
+      let match = false;
+      try {
+        match = await this.verifyPw(input.adminPassword!, u.verifier);
+      } catch {
+        match = false; // verificador corrupto: no autoriza
+      }
+      if (match) {
+        return { ok: true, authorization: { kind: 'admin_password', adminUserId: u.id }, authorizedBy: u.id, authorizedByName: u.name, expiresAt: null, tokenLabel: null };
+      }
+    }
+    return { ok: false, reason: 'contrasena_incorrecta', message: 'Contraseña de administrador incorrecta' };
+  }
+
+  /**
+   * Revalida una autorización ya obtenida (no puede volver a comprobar la contraseña: nunca se guarda).
+   * `trusted` = el servidor la validó en línea hace instantes, aunque el token no esté en la caché local.
+   */
+  private async checkAuthorization(
+    db: RawDb,
+    auth: ActionAuthorization,
+    purpose: TokenPurpose,
+    branchId: string,
+    userId: string,
+    trusted: boolean,
+  ): Promise<ResolvedAuthorization> {
+    if (auth.kind === 'admin_password') {
+      const u = await db.get<any>('SELECT * FROM users_local WHERE id = ?', [auth.adminUserId]);
+      if (!u && trusted) return { authorization: { kind: 'admin_password', adminUserId: auth.adminUserId }, authorizedBy: auth.adminUserId };
+      if (!u || !u.active || u.role !== 'gerente' || !parse<string[]>(u.branch_ids_json, []).includes(branchId)) {
+        throw new StoreError('autorizacion_invalida', 'El administrador que autoriza no está activo en esta sucursal');
+      }
+      return { authorization: { kind: 'admin_password', adminUserId: u.id }, authorizedBy: u.id };
+    }
+    if (auth.kind === 'token') {
+      const row = await db.get<any>('SELECT * FROM security_tokens_cache WHERE id = ?', [auth.tokenId]);
+      if (!row) {
+        if (trusted) return { authorization: { kind: 'token', tokenId: auth.tokenId }, authorizedBy: null };
+        throw new StoreError('autorizacion_invalida', 'Este dispositivo no conoce ese token. Sincroniza o verifícalo en línea.');
+      }
+      const token = this.rowToToken(row);
+      if (!trusted) {
+        if (token.maxUses !== null) token.usedCount += await this.pendingTokenUses(db, token.id);
+        if (!isTokenActive(token, purpose, branchId, this.nowIso(), userId)) {
+          throw new StoreError('autorizacion_invalida', 'El token ya no es válido para esta acción (vencido, revocado, agotado o de otro propósito/sucursal)');
+        }
+      }
+      return { authorization: { kind: 'token', tokenId: token.id }, authorizedBy: token.createdBy || null };
+    }
+    throw new StoreError('autorizacion_invalida', 'Autorización inválida');
+  }
+
+  /**
+   * Autorización de una acción sensible:
+   *  - El gerente (tiene el permiso) NO necesita autorización: su identidad queda como authorizedBy.
+   *  - El vendedor SIEMPRE necesita contraseña de administrador o token con el propósito correcto.
+   *  - Cualquier otro rol: sin permiso.
+   */
+  private async resolveSensitive(
+    tx: RawDb,
+    p: { actor: Actor; permission: Parameters<typeof can>[1]; purpose: TokenPurpose; branchId: string; authorization?: ActionAuthorization; trusted?: boolean; denied: string },
+  ): Promise<ResolvedAuthorization> {
+    if (can(p.actor.role, p.permission)) {
+      if (p.authorization) return this.checkAuthorization(tx, p.authorization, p.purpose, p.branchId, p.actor.userId, !!p.trusted);
+      return { authorization: { kind: 'admin_password', adminUserId: p.actor.userId }, authorizedBy: p.actor.userId };
+    }
+    if (p.actor.role !== 'vendedor') throw new StoreError('sin_permiso', p.denied);
+    if (!p.authorization) {
+      throw new StoreError('autorizacion_requerida', 'Se necesita la contraseña de un administrador o un token de seguridad para continuar', { purpose: p.purpose });
+    }
+    return this.checkAuthorization(tx, p.authorization, p.purpose, p.branchId, p.actor.userId, !!p.trusted);
   }
 
   /** Busca por código de barras, código interno o QR. Devuelve existencia local de la sucursal. */
@@ -386,6 +643,8 @@ export class LocalStore {
     if ((input.discountCents ?? 0) > 0 || input.items.some((i) => (i.lineDiscountCents ?? 0) > 0)) {
       if (!can(input.actor.role, 'ventas.descuento')) throw new StoreError('sin_permiso', 'Solo el gerente puede aplicar descuentos');
     }
+    const type: SaleType = input.type ?? 'venta';
+    if (type !== 'venta' && type !== 'limpia') throw new StoreError('tipo_invalido', 'Tipo de venta desconocido');
     const device = await this.getDeviceInfo();
     if (!device) throw new StoreError('sin_configurar', 'La terminal no está configurada (sucursal/terminal)');
 
@@ -394,14 +653,26 @@ export class LocalStore {
       const existing = await this.loadSale(tx, input.saleId);
       if (existing) return { sale: existing, duplicate: true, warnings: [] };
 
+      // Limpias: el gerente entra libremente; el vendedor solo con contraseña de admin o token 'limpias'.
+      let authz: ResolvedAuthorization | null = null;
+      if (type === 'limpia') {
+        authz = await this.resolveSensitive(tx, {
+          actor: input.actor, permission: 'caja.corte', purpose: 'limpias', branchId: input.branchId,
+          authorization: input.authorization, trusted: input.authorizationTrusted, denied: 'No tienes permiso para registrar Limpias',
+        });
+      }
+
       const sessionId = await this.currentSessionId(tx, input.terminalId);
       const requireOpen = ((await tx.get<{ value: string }>("SELECT value FROM meta WHERE key = 'require_open_cash'"))?.value ?? '1') !== '0';
       if (!sessionId && requireOpen) throw new StoreError('caja_cerrada', 'La caja está cerrada. Pide al gerente que la abra para vender.');
 
       // Precios y costos se toman del catálogo LOCAL en este instante (copia histórica).
       const lines: SaleLineInput[] = [];
-      const snaps: { productName: string; variantLabel: string; sku: string; code: string }[] = [];
+      const snaps: { productName: string; variantLabel: string; sku: string; code: string; kind: SaleItemKind; extraNote: string | null }[] = [];
+      const needed = new Map<string, { qty: number; name: string }>();
       for (const it of input.items) {
+        const kind: SaleItemKind = it.kind ?? 'producto';
+        if (kind !== 'producto' && kind !== 'extra') throw new StoreError('linea_invalida', 'Tipo de línea desconocido');
         const v = await tx.get<any>(
           `SELECT v.id, v.label, v.price_cents, v.cost_cents, v.barcode, v.internal_code, v.status AS vstatus, p.name, p.sku, p.status AS pstatus
            FROM variants v JOIN products p ON p.id = v.product_id WHERE v.id = ?`,
@@ -409,8 +680,34 @@ export class LocalStore {
         );
         if (!v) throw new StoreError('producto_no_encontrado', 'Producto no encontrado en el catálogo local');
         if (v.vstatus !== 'activo' || v.pstatus !== 'activo') throw new StoreError('producto_archivado', `"${v.name}" está archivado y no se puede vender`);
-        lines.push({ variantId: v.id, qty: it.qty, unitPriceCents: v.price_cents, unitCostCents: v.cost_cents, lineDiscountCents: it.lineDiscountCents });
-        snaps.push({ productName: v.name, variantLabel: v.label, sku: v.sku, code: v.barcode ?? v.internal_code });
+        if (kind === 'extra') {
+          // Cargo adicional sobre el producto: 1 pieza, costo 0 y SIN movimiento de inventario.
+          if (it.qty !== 1) throw new StoreError('cantidad_invalida', 'Un extra siempre es de 1 unidad');
+          if (!Number.isInteger(it.unitPriceCents) || (it.unitPriceCents as number) < 0) throw new StoreError('precio_invalido', 'Escribe el monto del extra (en centavos enteros, sin negativos)');
+          lines.push({ variantId: v.id, qty: 1, unitPriceCents: it.unitPriceCents as number, unitCostCents: 0, lineDiscountCents: it.lineDiscountCents, kind: 'extra' });
+          snaps.push({ productName: v.name, variantLabel: v.label, sku: v.sku, code: v.barcode ?? v.internal_code, kind: 'extra', extraNote: it.extraNote?.trim() || null });
+        } else {
+          lines.push({ variantId: v.id, qty: it.qty, unitPriceCents: v.price_cents, unitCostCents: v.cost_cents, lineDiscountCents: it.lineDiscountCents, kind: 'producto' });
+          snaps.push({ productName: v.name, variantLabel: v.label, sku: v.sku, code: v.barcode ?? v.internal_code, kind: 'producto', extraNote: null });
+          if (Number.isInteger(it.qty) && it.qty > 0) {
+            const cur = needed.get(v.id) ?? { qty: 0, name: `${v.name} ${v.label}`.trim() };
+            cur.qty += it.qty;
+            needed.set(v.id, cur);
+          }
+        }
+      }
+
+      // v2: NUNCA se vende más de lo disponible conocido (ni se generan existencias negativas).
+      for (const [variantId, need] of needed) {
+        const avail = await this.stockQtyIn(tx, variantId, input.branchId);
+        if (need.qty > avail) {
+          const shown = Math.max(0, avail);
+          throw new StoreError(
+            'sin_existencia',
+            shown === 0 ? `"${need.name}" no tiene existencia disponible` : `"${need.name}": solo hay ${shown} en existencia y se piden ${need.qty}`,
+            { variantId, requested: need.qty, available: shown, rawAvailable: avail },
+          );
+        }
       }
 
       const calc = computeSale(lines, input.discountCents ?? 0, input.payments);
@@ -422,59 +719,67 @@ export class LocalStore {
       const seq = (await tx.get<{ value: number }>('SELECT value FROM counters WHERE key = ?', [counterKey]))!.value;
       const folio = buildFolio(device.branchCode, device.terminalCode, day, seq);
 
+      const sellerId = input.sellerId ?? null;
+      const sellerName = input.sellerName ?? (sellerId ? await this.userName(tx, sellerId) : null);
+
       const sale: Sale = {
         id: input.saleId, folio, branchId: input.branchId, terminalId: input.terminalId,
         userId: input.actor.userId, userName: input.actor.userName, cashSessionId: sessionId, createdAt,
         subtotalCents: calc.subtotalCents, discountCents: calc.discountCents, totalCents: calc.totalCents,
         tenderedCents: calc.tenderedCents, changeCents: calc.changeCents, status: 'completada',
+        sellerId, sellerName, type,
         items: calc.lines.map((l, i) => ({
           id: `${input.saleId}:${i}`, variantId: l.variantId, productName: snaps[i]!.productName, variantLabel: snaps[i]!.variantLabel,
           sku: snaps[i]!.sku, code: snaps[i]!.code, qty: l.qty, unitPriceCents: l.unitPriceCents, unitCostCents: l.unitCostCents,
-          lineDiscountCents: l.lineDiscountCents, netCents: l.netCents,
+          lineDiscountCents: l.lineDiscountCents, netCents: l.netCents, kind: snaps[i]!.kind, extraNote: snaps[i]!.extraNote,
         })),
         payments: calc.payments,
       };
 
       const opId = newId();
-      await this.insertSaleRows(tx, sale, 'local', opId);
+      await this.insertSaleRows(tx, sale, 'local', opId, authz?.authorization ?? null);
       const branchRow = await tx.get<{ name: string }>('SELECT name FROM branches WHERE id = ?', [input.branchId]);
-      const ticket: TicketPayload = {
-        business: 'Esotérica Amara', branchName: branchRow?.name ?? device.branchCode, folio, createdAt, userName: sale.userName,
-        items: sale.items.map((i) => ({ name: i.productName, label: i.variantLabel, qty: i.qty, unitPriceCents: i.unitPriceCents, netCents: i.netCents })),
-        subtotalCents: sale.subtotalCents, discountCents: sale.discountCents, totalCents: sale.totalCents,
-        payments: sale.payments.map((p) => ({ method: p.method, amountCents: p.amountCents, tenderedCents: p.tenderedCents, changeCents: p.changeCents })),
-        status: 'completada',
-      };
+      const ticket = this.ticketFromSale(sale, branchRow?.name ?? device.branchCode);
       await tx.run('INSERT INTO tickets (id, sale_id, folio, payload_json) VALUES (?,?,?,?)', [newId(), sale.id, folio, j(ticket)]);
-      await this.enqueue(tx, { opId, type: 'sale.create', branchId: sale.branchId, terminalId: sale.terminalId, userId: sale.userId, localTs: createdAt, payload: { sale } });
-      await this.audit(tx, { userId: sale.userId, action: 'venta.crear', entity: 'sale', entityId: sale.id, branchId: sale.branchId, terminalId: sale.terminalId, detail: { folio, totalCents: sale.totalCents } });
-
-      const warnings: string[] = [];
-      for (const it of sale.items) {
-        const q = await tx.get<{ qty: number }>(
-          `SELECT (COALESCE((SELECT base_qty FROM stock WHERE variant_id = ? AND branch_id = ?), 0)
-            + COALESCE((SELECT SUM(delta) FROM inventory_movements WHERE variant_id = ? AND branch_id = ? AND synced = 0), 0)) AS qty`,
-          [it.variantId, sale.branchId, it.variantId, sale.branchId],
-        );
-        if ((q?.qty ?? 0) < 0) warnings.push(`${it.productName} ${it.variantLabel}: existencia local negativa (${q?.qty}); revisa el inventario`);
-      }
-      return { sale, duplicate: false, warnings };
+      await this.enqueue(tx, {
+        opId, type: 'sale.create', branchId: sale.branchId, terminalId: sale.terminalId, userId: sale.userId, localTs: createdAt,
+        payload: authz ? { sale, authorization: authz.authorization } : { sale },
+      });
+      await this.audit(tx, {
+        userId: sale.userId, action: type === 'limpia' ? 'venta.limpia' : 'venta.crear', entity: 'sale', entityId: sale.id, branchId: sale.branchId, terminalId: sale.terminalId,
+        detail: { folio, totalCents: sale.totalCents, sellerId, type, ...(authz ? { authorization: authz.authorization, authorizedBy: authz.authorizedBy } : {}) },
+      });
+      return { sale, duplicate: false, warnings: [] };
     });
   }
 
+  /** Existencia visible (base del servidor + movimientos locales pendientes) dentro de una transacción. */
+  private async stockQtyIn(db: RawDb, variantId: string, branchId: string): Promise<number> {
+    const r = await db.get<{ qty: number }>(
+      `SELECT (COALESCE((SELECT base_qty FROM stock WHERE variant_id = ? AND branch_id = ?), 0)
+        + COALESCE((SELECT SUM(delta) FROM inventory_movements WHERE variant_id = ? AND branch_id = ? AND synced = 0), 0)) AS qty`,
+      [variantId, branchId, variantId, branchId],
+    );
+    return r?.qty ?? 0;
+  }
+
   /** Inserta venta, partidas, pagos y movimientos de inventario (usado por venta local y por réplica LAN). */
-  private async insertSaleRows(tx: RawDb, sale: Sale, origin: 'local' | 'lan', opId: string): Promise<void> {
+  private async insertSaleRows(tx: RawDb, sale: Sale, origin: 'local' | 'lan', opId: string, authorization: ActionAuthorization | null = null): Promise<void> {
     await tx.run(
-      `INSERT INTO sales (id, folio, branch_id, terminal_id, user_id, user_name, cash_session_id, created_at, subtotal_cents, discount_cents, total_cents, tendered_cents, change_cents, status, origin)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [sale.id, sale.folio, sale.branchId, sale.terminalId, sale.userId, sale.userName, sale.cashSessionId, sale.createdAt, sale.subtotalCents, sale.discountCents, sale.totalCents, sale.tenderedCents, sale.changeCents, sale.status, origin],
+      `INSERT INTO sales (id, folio, branch_id, terminal_id, user_id, user_name, cash_session_id, created_at, subtotal_cents, discount_cents, total_cents, tendered_cents, change_cents, status, origin,
+                          seller_id, seller_name, sale_type, authorization_json)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [sale.id, sale.folio, sale.branchId, sale.terminalId, sale.userId, sale.userName, sale.cashSessionId, sale.createdAt, sale.subtotalCents, sale.discountCents, sale.totalCents, sale.tenderedCents, sale.changeCents, sale.status, origin,
+        sale.sellerId ?? null, sale.sellerName ?? null, sale.type ?? 'venta', authorization ? j(authorization) : null],
     );
     for (const [i, it] of sale.items.entries()) {
+      const kind: SaleItemKind = it.kind ?? 'producto';
       await tx.run(
-        `INSERT INTO sale_items (id, sale_id, variant_id, product_name, variant_label, sku, code, qty, unit_price_cents, unit_cost_cents, line_discount_cents, net_cents)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [it.id, sale.id, it.variantId, it.productName, it.variantLabel, it.sku, it.code, it.qty, it.unitPriceCents, it.unitCostCents, it.lineDiscountCents, it.netCents],
+        `INSERT INTO sale_items (id, sale_id, variant_id, product_name, variant_label, sku, code, qty, unit_price_cents, unit_cost_cents, line_discount_cents, net_cents, kind, extra_note)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [it.id, sale.id, it.variantId, it.productName, it.variantLabel, it.sku, it.code, it.qty, it.unitPriceCents, it.unitCostCents, it.lineDiscountCents, it.netCents, kind, it.extraNote ?? null],
       );
+      if (kind === 'extra') continue; // un extra es solo un cargo: NO mueve inventario
       await tx.run(
         `INSERT INTO inventory_movements (id, variant_id, branch_id, delta, type, reason, ref_type, ref_id, user_id, created_at, op_id, synced)
          VALUES (?,?,?,?,?,?,?,?,?,?,?,0)`,
@@ -494,15 +799,18 @@ export class LocalStore {
   }
 
   private async hydrateSale(tx: RawDb, s: any): Promise<Sale> {
-    const items = await tx.all<any>('SELECT * FROM sale_items WHERE sale_id = ? ORDER BY id', [s.id]);
-    const pays = await tx.all<any>('SELECT * FROM sale_payments WHERE sale_id = ? ORDER BY id', [s.id]);
+    // rowid conserva el orden de captura (ordenar por id de texto pondría ":10" antes de ":2").
+    const items = await tx.all<any>('SELECT * FROM sale_items WHERE sale_id = ? ORDER BY rowid', [s.id]);
+    const pays = await tx.all<any>('SELECT * FROM sale_payments WHERE sale_id = ? ORDER BY rowid', [s.id]);
     return {
       id: s.id, folio: s.folio, branchId: s.branch_id, terminalId: s.terminal_id, userId: s.user_id, userName: s.user_name,
       cashSessionId: s.cash_session_id, createdAt: s.created_at, subtotalCents: s.subtotal_cents, discountCents: s.discount_cents,
       totalCents: s.total_cents, tenderedCents: s.tendered_cents, changeCents: s.change_cents, status: s.status,
+      sellerId: s.seller_id ?? null, sellerName: s.seller_name ?? null, type: (s.sale_type ?? 'venta') as SaleType,
       items: items.map((i) => ({
         id: i.id, variantId: i.variant_id, productName: i.product_name, variantLabel: i.variant_label, sku: i.sku, code: i.code, qty: i.qty,
         unitPriceCents: i.unit_price_cents, unitCostCents: i.unit_cost_cents, lineDiscountCents: i.line_discount_cents, netCents: i.net_cents,
+        kind: (i.kind ?? 'producto') as SaleItemKind, extraNote: i.extra_note ?? null,
       })),
       payments: pays.map((p) => ({ method: p.method, amountCents: p.amount_cents, tenderedCents: p.tendered_cents ?? undefined, changeCents: p.change_cents ?? undefined })),
     };
@@ -514,17 +822,45 @@ export class LocalStore {
   }
 
   /** Archivo de tickets (solo gerente para ver todos; el vendedor pasa su userId). */
-  async listSales(f: { from?: string; to?: string; branchId?: string; folio?: string; userId?: string; terminalId?: string; status?: string; limit?: number }) {
+  async listSales(f: { from?: string; to?: string; branchId?: string; folio?: string; userId?: string; terminalId?: string; status?: string; type?: SaleType; limit?: number }) {
     return this.db.all<any>(
       `SELECT id, folio, branch_id AS branchId, terminal_id AS terminalId, user_id AS userId, user_name AS userName,
+              seller_id AS sellerId, seller_name AS sellerName, sale_type AS type,
               created_at AS createdAt, total_cents AS totalCents, status, sync_state AS syncState, origin
        FROM sales WHERE (? IS NULL OR created_at >= ?) AND (? IS NULL OR created_at < ?) AND (? IS NULL OR branch_id = ?)
          AND (? IS NULL OR folio LIKE ?) AND (? IS NULL OR user_id = ?) AND (? IS NULL OR terminal_id = ?) AND (? IS NULL OR status = ?)
+         AND (? IS NULL OR sale_type = ?)
        ORDER BY created_at DESC LIMIT ?`,
       [f.from ?? null, f.from ?? null, f.to ?? null, f.to ?? null, f.branchId ?? null, f.branchId ?? null,
         f.folio ?? null, `%${f.folio ?? ''}%`, f.userId ?? null, f.userId ?? null, f.terminalId ?? null, f.terminalId ?? null,
-        f.status ?? null, f.status ?? null, f.limit ?? 500],
+        f.status ?? null, f.status ?? null, f.type ?? null, f.type ?? null, f.limit ?? 500],
     );
+  }
+
+  /**
+   * Tickets de hoy (hora de México) SOLO con lo vendido: producto, cantidad y precio. No es el ticket impreso.
+   * Pensado para la consulta del gerente en el móvil. Más recientes primero.
+   */
+  async listTodaySalesSummary(opts: { branchId?: string | null; day?: string } = {}): Promise<TodaySaleSummary[]> {
+    const day = opts.day ?? mxDayKey(this.nowIso());
+    const { from, to } = mxDayBounds(day);
+    const rows = await this.db.all<any>(
+      'SELECT * FROM sales WHERE created_at >= ? AND created_at < ? AND (? IS NULL OR branch_id = ?) ORDER BY created_at DESC',
+      [from, to, opts.branchId ?? null, opts.branchId ?? null],
+    );
+    const out: TodaySaleSummary[] = [];
+    for (const r of rows) {
+      const items = await this.db.all<any>('SELECT * FROM sale_items WHERE sale_id = ? ORDER BY rowid', [r.id]);
+      out.push({
+        saleId: r.id, folio: r.folio, createdAt: r.created_at, status: r.status, type: (r.sale_type ?? 'venta') as SaleType,
+        sellerId: r.seller_id ?? null, sellerName: r.seller_name ?? null, totalCents: r.total_cents,
+        items: items.map((i) => ({
+          name: i.product_name, label: i.variant_label, qty: i.qty, unitPriceCents: i.unit_price_cents, netCents: i.net_cents,
+          kind: (i.kind ?? 'producto') as SaleItemKind, extraNote: i.extra_note ?? null,
+        })),
+      });
+    }
+    return out;
   }
 
   async getTicket(idOrFolio: string): Promise<{ payload: TicketPayload; printCount: number; lastPrintError: string | null; saleId: string } | undefined> {
@@ -558,32 +894,46 @@ export class LocalStore {
     return m;
   }
 
-  private async writeAdjustment(tx: RawDb, adj: SaleAdjustment, sale: Sale, folio: string): Promise<void> {
+  private async writeAdjustment(tx: RawDb, adj: SaleAdjustment, sale: Sale, folio: string, authz: ResolvedAuthorization): Promise<void> {
     await tx.run(
-      `INSERT INTO sale_adjustments (id, sale_id, branch_id, terminal_id, user_id, type, created_at, reason, amount_cents, payments_json, items_json, cash_session_id)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [adj.id, adj.saleId, adj.branchId, adj.terminalId, adj.userId, adj.type, adj.createdAt, adj.reason, adj.amountCents, j(adj.payments), j(adj.items), adj.cashSessionId],
+      `INSERT INTO sale_adjustments (id, sale_id, branch_id, terminal_id, user_id, type, created_at, reason, amount_cents, payments_json, items_json, cash_session_id, authorization_json, authorized_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [adj.id, adj.saleId, adj.branchId, adj.terminalId, adj.userId, adj.type, adj.createdAt, adj.reason, adj.amountCents, j(adj.payments), j(adj.items), adj.cashSessionId, j(authz.authorization), authz.authorizedBy],
     );
     const opId = newId();
     for (const [i, it] of adj.items.entries()) {
-      if (!it.restock) continue;
+      if (!it.restock || it.kind === 'extra') continue; // un extra devuelve dinero, nunca existencias
       await tx.run(
         `INSERT INTO inventory_movements (id, variant_id, branch_id, delta, type, reason, ref_type, ref_id, user_id, created_at, op_id, synced)
          VALUES (?,?,?,?,?,?,?,?,?,?,?,0)`,
         [`${adj.id}:m${i}`, it.variantId, adj.branchId, it.qty, 'devolucion', `${adj.type === 'cancelacion' ? 'Cancelación' : 'Devolución'} ${folio}`, 'adjustment', adj.id, adj.userId, adj.createdAt, opId],
       );
     }
-    await this.enqueue(tx, { opId, type: 'sale.adjust', branchId: adj.branchId, terminalId: adj.terminalId, userId: adj.userId, localTs: adj.createdAt, payload: { adjustment: adj } });
-    await this.audit(tx, { userId: adj.userId, action: `venta.${adj.type}`, entity: 'sale', entityId: sale.id, branchId: adj.branchId, terminalId: adj.terminalId, detail: { folio, amountCents: adj.amountCents, reason: adj.reason } });
+    await this.enqueue(tx, { opId, type: 'sale.adjust', branchId: adj.branchId, terminalId: adj.terminalId, userId: adj.userId, localTs: adj.createdAt, payload: { adjustment: adj, authorization: authz.authorization } });
+    await this.audit(tx, {
+      userId: adj.userId, action: `venta.${adj.type}`, entity: 'sale', entityId: sale.id, branchId: adj.branchId, terminalId: adj.terminalId,
+      detail: { folio, amountCents: adj.amountCents, reason: adj.reason, authorization: authz.authorization, authorizedBy: authz.authorizedBy },
+    });
     void sale;
   }
 
-  async cancelSale(p: { adjustmentId?: string; saleId: string; actor: Actor; terminalId: string; reason: string }): Promise<SaleAdjustment> {
-    if (!can(p.actor.role, 'ventas.cancelar')) throw new StoreError('sin_permiso', 'Solo el gerente puede cancelar ventas');
+  /**
+   * Cancela una venta completa. El gerente no necesita `authorization`; el vendedor SIEMPRE la necesita
+   * (contraseña de administrador o token con propósito 'cancelacion').
+   */
+  async cancelSale(p: {
+    adjustmentId?: string; saleId: string; actor: Actor; terminalId: string; reason: string;
+    authorization?: ActionAuthorization; authorizationTrusted?: boolean;
+  }): Promise<SaleAdjustment> {
+    if (p.actor.role !== 'gerente' && p.actor.role !== 'vendedor') throw new StoreError('sin_permiso', 'No tienes permiso para cancelar ventas');
     if (p.reason.trim().length < 3) throw new StoreError('motivo_requerido', 'Escribe el motivo de la cancelación');
     return this.db.transaction(async (tx) => {
       const sale = await this.loadSale(tx, p.saleId);
       if (!sale) throw new StoreError('venta_no_encontrada', 'Venta no encontrada');
+      const authz = await this.resolveSensitive(tx, {
+        actor: p.actor, permission: 'ventas.cancelar', purpose: 'cancelacion', branchId: sale.branchId,
+        authorization: p.authorization, trusted: p.authorizationTrusted, denied: 'Solo el gerente puede cancelar ventas',
+      });
       if (sale.status !== 'completada') throw new StoreError('ya_cancelada', 'La venta ya está cancelada');
       const prior = await this.priorRefundedQty(tx, sale.id);
       if (prior.size > 0) throw new StoreError('tiene_devoluciones', 'La venta ya tiene devoluciones; registra devoluciones para el resto');
@@ -595,24 +945,36 @@ export class LocalStore {
         id: p.adjustmentId ?? newId(), saleId: sale.id, branchId: sale.branchId, terminalId: p.terminalId, userId: p.actor.userId,
         type: 'cancelacion', createdAt: this.nowIso(), reason: p.reason.trim(), amountCents: sale.totalCents,
         payments: sale.payments.map((x) => ({ method: x.method, amountCents: x.amountCents })),
-        items: sale.items.map((i) => ({ saleItemId: i.id, variantId: i.variantId, productName: i.productName, variantLabel: i.variantLabel, qty: i.qty, unitCostCents: i.unitCostCents, netCents: i.netCents, restock: true })),
+        items: sale.items.map((i) => ({
+          saleItemId: i.id, variantId: i.variantId, productName: i.productName, variantLabel: i.variantLabel, qty: i.qty, unitCostCents: i.unitCostCents,
+          netCents: i.netCents, restock: (i.kind ?? 'producto') !== 'extra', kind: i.kind ?? 'producto',
+        })),
         cashSessionId: sessionId,
       };
-      await this.writeAdjustment(tx, adj, sale, sale.folio);
+      await this.writeAdjustment(tx, adj, sale, sale.folio, authz);
       await tx.run("UPDATE sales SET status = 'cancelada' WHERE id = ?", [sale.id]);
       return adj;
     });
   }
 
+  /**
+   * Devolución (total o parcial). El gerente no necesita `authorization`; el vendedor SIEMPRE la necesita
+   * (contraseña de administrador o token con propósito 'devolucion').
+   */
   async refundSale(p: {
     adjustmentId?: string; saleId: string; actor: Actor; terminalId: string; reason: string; method?: PaymentMethod;
     lines: { saleItemId: string; qty: number; restock?: boolean }[];
+    authorization?: ActionAuthorization; authorizationTrusted?: boolean;
   }): Promise<SaleAdjustment> {
-    if (!can(p.actor.role, 'ventas.devolver')) throw new StoreError('sin_permiso', 'Solo el gerente puede registrar devoluciones');
+    if (p.actor.role !== 'gerente' && p.actor.role !== 'vendedor') throw new StoreError('sin_permiso', 'No tienes permiso para registrar devoluciones');
     if (p.reason.trim().length < 3) throw new StoreError('motivo_requerido', 'Escribe el motivo de la devolución');
     return this.db.transaction(async (tx) => {
       const sale = await this.loadSale(tx, p.saleId);
       if (!sale) throw new StoreError('venta_no_encontrada', 'Venta no encontrada');
+      const authz = await this.resolveSensitive(tx, {
+        actor: p.actor, permission: 'ventas.devolver', purpose: 'devolucion', branchId: sale.branchId,
+        authorization: p.authorization, trusted: p.authorizationTrusted, denied: 'Solo el gerente puede registrar devoluciones',
+      });
       if (sale.status !== 'completada') throw new StoreError('ya_cancelada', 'La venta está cancelada');
       const prior = await this.priorRefundedQty(tx, sale.id);
       const items: AdjustmentItem[] = [];
@@ -628,7 +990,11 @@ export class LocalStore {
         }
         prior.set(line.id, (prior.get(line.id) ?? 0) + l.qty);
         amount += refund;
-        items.push({ saleItemId: line.id, variantId: line.variantId, productName: line.productName, variantLabel: line.variantLabel, qty: l.qty, unitCostCents: line.unitCostCents, netCents: refund, restock: l.restock !== false });
+        const isExtra = (line.kind ?? 'producto') === 'extra';
+        items.push({
+          saleItemId: line.id, variantId: line.variantId, productName: line.productName, variantLabel: line.variantLabel, qty: l.qty,
+          unitCostCents: line.unitCostCents, netCents: refund, restock: isExtra ? false : l.restock !== false, kind: line.kind ?? 'producto',
+        });
       }
       if (items.length === 0 || amount <= 0) throw new StoreError('sin_partidas', 'No hay partidas por devolver');
       const method = p.method ?? (sale.payments.some((x) => x.method === 'efectivo') ? 'efectivo' : sale.payments[0]!.method);
@@ -639,7 +1005,7 @@ export class LocalStore {
         type: 'devolucion', createdAt: this.nowIso(), reason: p.reason.trim(), amountCents: amount,
         payments: [{ method, amountCents: amount }], items, cashSessionId: sessionId,
       };
-      await this.writeAdjustment(tx, adj, sale, sale.folio);
+      await this.writeAdjustment(tx, adj, sale, sale.folio, authz);
       return adj;
     });
   }
@@ -765,8 +1131,16 @@ export class LocalStore {
     return { session: s, breakdown: computeCashBreakdown(s.opening_cents, sessionId, salesFull, adjs, movs) };
   }
 
-  async closeCash(p: { actor: Actor; terminalId: string; countedCents: number; denominations?: Record<string, number>; notes?: string; offline?: boolean }) {
-    if (!can(p.actor.role, 'caja.corte')) throw new StoreError('sin_permiso', 'Solo el gerente puede realizar el corte de caja');
+  /**
+   * Corte de caja. v2: NO se puede cerrar sin autorización.
+   *  - Gerente: su propia sesión es la autorización (queda como `closeAuthorization` y `authorizedBy`).
+   *  - Vendedor: obligatoria `authorization` (contraseña de administrador o token 'cierre_caja').
+   */
+  async closeCash(p: {
+    actor: Actor; terminalId: string; countedCents: number; denominations?: Record<string, number>; notes?: string; offline?: boolean;
+    authorization?: ActionAuthorization; authorizationTrusted?: boolean;
+  }) {
+    if (p.actor.role !== 'gerente' && p.actor.role !== 'vendedor') throw new StoreError('sin_permiso', 'No tienes permiso para realizar el corte de caja');
     if (!Number.isInteger(p.countedCents) || p.countedCents < 0) throw new StoreError('importe_invalido', 'Efectivo contado inválido');
     const open = await this.currentSession(p.terminalId);
     if (!open) throw new StoreError('caja_cerrada', 'No hay caja abierta en esta terminal');
@@ -776,28 +1150,62 @@ export class LocalStore {
     const difference = cashDifference(breakdown.expectedCents, p.countedCents);
     const closedAt = this.nowIso();
     const closure = { breakdown, countedCents: p.countedCents, differenceCents: difference, denominations: p.denominations ?? null, provisional, pendingOpsAtClose: pendingOthers };
-    await this.db.transaction(async (tx) => {
+    const authz = await this.db.transaction(async (tx) => {
+      const authz = await this.resolveSensitive(tx, {
+        actor: p.actor, permission: 'caja.corte', purpose: 'cierre_caja', branchId: open.branch_id,
+        authorization: p.authorization, trusted: p.authorizationTrusted, denied: 'No tienes permiso para realizar el corte de caja',
+      });
       await tx.run(
         `UPDATE cash_sessions SET status = 'cerrada', closed_by = ?, closed_at = ?, counted_cents = ?, expected_cents = ?, difference_cents = ?,
-           provisional = ?, reconciliation = 'pendiente', closure_json = ?, notes = ? WHERE id = ?`,
-        [p.actor.userId, closedAt, p.countedCents, breakdown.expectedCents, difference, provisional ? 1 : 0, j(closure), p.notes ?? null, open.id],
+           provisional = ?, reconciliation = 'pendiente', closure_json = ?, notes = ?, close_authorization_json = ?, close_authorized_by = ? WHERE id = ?`,
+        [p.actor.userId, closedAt, p.countedCents, breakdown.expectedCents, difference, provisional ? 1 : 0, j(closure), p.notes ?? null, j(authz.authorization), authz.authorizedBy, open.id],
       );
       await this.enqueue(tx, {
         opId: newId(), type: 'cash.close', branchId: open.branch_id, terminalId: p.terminalId, userId: p.actor.userId, localTs: closedAt,
-        payload: { sessionId: open.id, closedBy: p.actor.userId, closedAt, countedCents: p.countedCents, expectedCents: breakdown.expectedCents, differenceCents: difference, provisional, denominations: p.denominations ?? null, notes: p.notes ?? null, breakdown },
+        payload: {
+          sessionId: open.id, closedBy: p.actor.userId, closedAt, countedCents: p.countedCents, expectedCents: breakdown.expectedCents, differenceCents: difference,
+          provisional, denominations: p.denominations ?? null, notes: p.notes ?? null, breakdown, authorization: authz.authorization,
+        },
       });
-      await this.audit(tx, { userId: p.actor.userId, action: 'caja.cerrar', entity: 'cash_session', entityId: open.id, branchId: open.branch_id, terminalId: p.terminalId, detail: { expected: breakdown.expectedCents, counted: p.countedCents, difference, provisional } });
+      await this.audit(tx, {
+        userId: p.actor.userId, action: 'caja.cerrar', entity: 'cash_session', entityId: open.id, branchId: open.branch_id, terminalId: p.terminalId,
+        detail: { expected: breakdown.expectedCents, counted: p.countedCents, difference, provisional, authorization: authz.authorization, authorizedBy: authz.authorizedBy },
+      });
+      return authz;
     });
-    return { sessionId: open.id, breakdown, countedCents: p.countedCents, differenceCents: difference, provisional };
+    return {
+      sessionId: open.id, breakdown, countedCents: p.countedCents, expectedCents: breakdown.expectedCents, differenceCents: difference, provisional,
+      openedAt: open.opened_at as string, openingCents: open.opening_cents as number, closedAt, closedBy: p.actor.userId,
+      authorization: authz.authorization, authorizedBy: authz.authorizedBy,
+    };
+  }
+
+  /** Un corte ya hecho (para el "ticket de cierre"): apertura, cierre, esperado, contado, diferencia y quién autorizó. */
+  async getClosure(sessionId: string) {
+    const r = await this.db.get<any>('SELECT * FROM cash_sessions WHERE id = ?', [sessionId]);
+    if (!r) return undefined;
+    return {
+      id: r.id as string, branchId: r.branch_id as string, terminalId: r.terminal_id as string, status: r.status as 'abierta' | 'cerrada',
+      openedBy: r.opened_by as string, openedAt: r.opened_at as string, openingCents: r.opening_cents as number,
+      closedBy: (r.closed_by ?? null) as string | null, closedAt: (r.closed_at ?? null) as string | null,
+      countedCents: (r.counted_cents ?? null) as number | null, expectedCents: (r.expected_cents ?? null) as number | null,
+      differenceCents: (r.difference_cents ?? null) as number | null, provisional: !!r.provisional, reconciliation: r.reconciliation as string,
+      closeAuthorization: parse<ActionAuthorization | null>(r.close_authorization_json, null), authorizedBy: (r.close_authorized_by ?? null) as string | null,
+      authorizedByName: await this.userName(this.db, r.close_authorized_by),
+      openedByName: await this.userName(this.db, r.opened_by), closedByName: await this.userName(this.db, r.closed_by),
+      closure: parse<any>(r.closure_json, null), notes: (r.notes ?? null) as string | null,
+    };
   }
 
   async listClosures(limit = 100) {
-    return this.db.all<any>(
-      `SELECT id, branch_id AS branchId, terminal_id AS terminalId, opened_at AS openedAt, closed_at AS closedAt, opening_cents AS openingCents,
-              expected_cents AS expectedCents, counted_cents AS countedCents, difference_cents AS differenceCents, provisional, reconciliation
+    const rows = await this.db.all<any>(
+      `SELECT id, branch_id AS branchId, terminal_id AS terminalId, opened_at AS openedAt, opened_by AS openedBy, closed_at AS closedAt, closed_by AS closedBy,
+              opening_cents AS openingCents, expected_cents AS expectedCents, counted_cents AS countedCents, difference_cents AS differenceCents,
+              provisional, reconciliation, close_authorization_json AS closeAuthorizationJson, close_authorized_by AS authorizedBy
        FROM cash_sessions WHERE status = 'cerrada' ORDER BY closed_at DESC LIMIT ?`,
       [limit],
     );
+    return rows.map(({ closeAuthorizationJson, ...r }) => ({ ...r, closeAuthorization: parse<ActionAuthorization | null>(closeAuthorizationJson, null) }));
   }
 
   // ───────────────────────── Resumen / estadísticas locales ─────────────────────────
@@ -809,12 +1217,12 @@ export class LocalStore {
     );
     const sales: ReportSale[] = [];
     for (const s of saleRows) {
-      const items = await this.db.all<any>('SELECT variant_id, product_name, variant_label, qty, unit_cost_cents, net_cents FROM sale_items WHERE sale_id = ?', [s.id]);
+      const items = await this.db.all<any>('SELECT variant_id, product_name, variant_label, qty, unit_cost_cents, net_cents, kind FROM sale_items WHERE sale_id = ?', [s.id]);
       const pays = await this.db.all<any>('SELECT method, amount_cents FROM sale_payments WHERE sale_id = ?', [s.id]);
       sales.push({
         id: s.id, branchId: s.branch_id, createdAt: s.created_at, totalCents: s.total_cents,
         payments: pays.map((p) => ({ method: p.method, amountCents: p.amount_cents })),
-        items: items.map((i) => ({ variantId: i.variant_id, productName: i.product_name, variantLabel: i.variant_label, qty: i.qty, unitCostCents: i.unit_cost_cents, netCents: i.net_cents })),
+        items: items.map((i) => ({ variantId: i.variant_id, productName: i.product_name, variantLabel: i.variant_label, qty: i.qty, unitCostCents: i.unit_cost_cents, netCents: i.net_cents, kind: (i.kind ?? 'producto') as SaleItemKind })),
       });
     }
     const adjRows = await this.db.all<any>(
@@ -849,7 +1257,8 @@ export class LocalStore {
     return this.db.transaction(async (tx) => {
       if (await tx.get('SELECT 1 AS x FROM sales WHERE id = ?', [sale.id])) return { duplicate: true };
       if (await tx.get('SELECT 1 AS x FROM sync_queue WHERE op_id = ?', [op.opId])) return { duplicate: true };
-      await this.insertSaleRows(tx, sale, 'lan', op.opId);
+      const authorization = (op.payload as { authorization?: ActionAuthorization } | null)?.authorization ?? null;
+      await this.insertSaleRows(tx, sale, 'lan', op.opId, authorization);
       await tx.run('INSERT INTO tickets (id, sale_id, folio, payload_json) VALUES (?,?,?,?)', [newId(), sale.id, sale.folio, j(this.ticketFromSale(sale, sale.branchId))]);
       await this.enqueue(tx, { ...op, origin: 'lan' });
       await this.audit(tx, { userId: sale.userId, action: 'venta.replica_lan', entity: 'sale', entityId: sale.id, branchId: sale.branchId, terminalId: sale.terminalId, detail: { folio: sale.folio } });
@@ -860,10 +1269,15 @@ export class LocalStore {
   private ticketFromSale(sale: Sale, branchName: string): TicketPayload {
     return {
       business: 'Esotérica Amara', branchName, folio: sale.folio, createdAt: sale.createdAt, userName: sale.userName,
-      items: sale.items.map((i) => ({ name: i.productName, label: i.variantLabel, qty: i.qty, unitPriceCents: i.unitPriceCents, netCents: i.netCents })),
+      // El vendedor (sellerName) es dato interno: NO se imprime en el ticket.
+      items: sale.items.map((i) => ({
+        name: i.productName, label: i.variantLabel, qty: i.qty, unitPriceCents: i.unitPriceCents, netCents: i.netCents,
+        kind: i.kind ?? 'producto', extraNote: i.extraNote ?? null,
+      })),
       subtotalCents: sale.subtotalCents, discountCents: sale.discountCents, totalCents: sale.totalCents,
       payments: sale.payments.map((p) => ({ method: p.method, amountCents: p.amountCents, tenderedCents: p.tenderedCents, changeCents: p.changeCents })),
       status: sale.status,
+      saleType: sale.type ?? 'venta',
     };
   }
 

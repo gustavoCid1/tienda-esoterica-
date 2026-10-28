@@ -27,7 +27,10 @@ export interface AppSettings {
    * 'medido': se mide el alto del ticket y se envía como tamaño de página personalizado.
    */
   printPageSizeMode: 'driver' | 'medido';
-  /** Imprimir las dos copias automáticamente al guardar la venta. */
+  /**
+   * Mandar a imprimir las dos copias apenas se abre la vista previa del ticket (sin esperar el clic en "Imprimir").
+   * v2: por omisión NO; el modal de vista previa tiene un solo botón Imprimir que manda las dos copias.
+   */
   autoPrint: boolean;
   labelWidthMm: number;
   labelHeightMm: number;
@@ -51,7 +54,7 @@ export function defaultSettings(documentsDir: string): AppSettings {
     labelPrinter: '',
     paperMm: 80,
     printPageSizeMode: 'driver',
-    autoPrint: true,
+    autoPrint: false,
     labelWidthMm: 50,
     labelHeightMm: 30,
     backupDir: joinPath(documentsDir, 'Esoterica Amara', 'Respaldos'),

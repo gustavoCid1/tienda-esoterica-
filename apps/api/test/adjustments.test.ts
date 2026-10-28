@@ -70,3 +70,30 @@ describe('buildReturn', () => {
     expect(ok.cashSessionId).toBeNull();
   });
 });
+
+describe('v2: líneas extra en cancelaciones y devoluciones', () => {
+  function withExtra(): Sale {
+    const s = makeSale({ qty: 2 }); // 18000
+    s.items.push({
+      id: `${s.id}:1`, variantId: s.items[0]!.variantId, productName: 'Vela', variantLabel: 'Chica', sku: 'VEL', code: 'AMA1', qty: 1, unitPriceCents: 2500,
+      unitCostCents: 0, lineDiscountCents: 0, netCents: 2500, kind: 'extra', extraNote: 'Aceite',
+    } as any);
+    s.totalCents = 20500;
+    s.payments = [{ method: 'efectivo', amountCents: 20500 }];
+    return s;
+  }
+  it('cancelar: el extra regresa dinero pero NO existencias; el producto sí regresa existencias', () => {
+    const a = buildCancellation(withExtra(), [], base);
+    expect(a.amountCents).toBe(20500);
+    expect(a.items.map((i) => [i.kind, i.restock])).toEqual([['producto', true], ['extra', false]]);
+  });
+  it('devolver un extra: aunque pidan restock=true, queda sin restock; el producto respeta lo pedido', () => {
+    const s = withExtra();
+    const extra = buildReturn(s, [], { ...base, lines: [{ saleItemId: s.items[1]!.id, qty: 1, restock: true }], payments: [{ method: 'efectivo', amountCents: 2500 }] });
+    expect(extra.items[0]!.restock).toBe(false);
+    expect(extra.items[0]!.kind).toBe('extra');
+    expect(extra.amountCents).toBe(2500);
+    const prod = buildReturn(s, [], { ...base, lines: [{ saleItemId: s.items[0]!.id, qty: 1, restock: false }], payments: [{ method: 'efectivo', amountCents: 9000 }] });
+    expect([prod.items[0]!.kind, prod.items[0]!.restock]).toEqual(['producto', false]);
+  });
+});

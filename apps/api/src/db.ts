@@ -20,6 +20,8 @@ export const COLLECTIONS = [
   'users', 'branches', 'terminals', 'products', 'variants', 'stock', 'inventory_movements', 'transfers',
   'sales', 'sale_adjustments', 'cash_sessions', 'cash_movements', 'grants', 'sync_events', 'sync_conflicts',
   'audit_log', 'settings', 'backups_log', 'dashboard_prefs', 'counters',
+  // v2
+  'security_tokens', 'security_token_uses', 'security_verifications',
 ] as const;
 
 export async function connect(): Promise<Db> {
@@ -73,5 +75,17 @@ export async function ensureIndexes(): Promise<void> {
     idx('sync_conflicts', [[{ status: 1, createdAt: -1 }], [{ branchId: 1, status: 1 }]]),
     idx('audit_log', [[{ at: -1 }], [{ entity: 1, entityId: 1 }]]),
     idx('dashboard_prefs', [[{ userId: 1 }, { unique: true }]]),
+    // v2: tokens de seguridad. Solo se guardan sal + hash; el código en claro nunca.
+    idx('security_tokens', [
+      [{ createdAt: -1 }],
+      [{ branchId: 1, expiresAt: -1 }],
+      [{ expiresAt: 1 }],
+      [{ revokedAt: 1 }],
+      [{ createdBy: 1, createdAt: -1 }],
+    ]),
+    // Una marca por (token, operación): hace idempotente el conteo de usos.
+    idx('security_token_uses', [[{ tokenId: 1, at: -1 }], [{ opId: 1 }]]),
+    // Verificaciones en línea recientes (para que una ruta sepa que el código/contraseña ya se comprobó). Caducan solas.
+    idx('security_verifications', [[{ expireAt: 1 }, { expireAfterSeconds: 0 }], [{ requesterKey: 1, purpose: 1, branchId: 1 }]]),
   ]);
 }

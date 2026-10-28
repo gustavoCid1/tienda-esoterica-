@@ -4,7 +4,7 @@
  *
  * Seguridad de montaje:
  *  - TODO excepto /health y /auth/login exige token (`authenticate`).
- *  - Los tokens de TERMINAL solo pasan en /sync/*: el resto monta `requireUser`.
+ *  - Los tokens de TERMINAL solo pasan en /sync/* y /security/verify: el resto monta `requireUser`.
  *  - Cada router aplica además su permiso por ruta (`requirePerm`), leído del rol en la base.
  */
 import cors from 'cors';
@@ -22,6 +22,8 @@ import { catalogRouter } from './routes/catalog.ts';
 import { inventoryRouter } from './routes/inventory.ts';
 import { prefsRouter } from './routes/prefs.ts';
 import { salesRouter } from './routes/sales.ts';
+import { securityRouter } from './routes/security.ts';
+import { settingsRouter } from './routes/settings.ts';
 import { statsRouter } from './routes/stats.ts';
 import { syncRouter } from './routes/sync.ts';
 
@@ -70,7 +72,9 @@ export function createApp(opts: AppOptions = {}) {
   });
 
   app.use('/auth', authRouter); // /auth/login es pública; el resto autentica dentro del router
-  app.use('/sync', auth, syncRouter); // única zona donde se acepta token de terminal
+  app.use('/sync', auth, syncRouter); // zona donde se acepta token de terminal
+  // /security/verify también la usa una terminal; las rutas de tokens exigen sesión de usuario con permiso dentro del router.
+  app.use('/security', auth, securityRouter);
   for (const [path, router] of [
     ['/catalog', catalogRouter],
     ['/inventory', inventoryRouter],
@@ -78,6 +82,7 @@ export function createApp(opts: AppOptions = {}) {
     ['/cash', cashRouter],
     ['/stats', statsRouter],
     ['/prefs', prefsRouter],
+    ['/settings', settingsRouter],
     ['/admin', adminRouter],
   ] as const) {
     app.use(path, auth, requireUser, router);

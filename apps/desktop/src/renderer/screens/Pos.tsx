@@ -7,14 +7,18 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { CatalogHit } from '@amara/database';
-import { can } from '@amara/shared';
-import type { BranchRow, CashStatus } from '../../shared/ipc.ts';
+import { DEFAULT_EXTRA_CATEGORIES, can, isExtraCategory } from '@amara/shared';
+import type { BranchRow, CashStatus, SellerRow } from '../../shared/ipc.ts';
+import { DocPreviewModal } from '../components/DocPreviewModal.tsx';
+import { ExtraModal } from '../components/ExtraModal.tsx';
 import { Banner } from '../components/Field.tsx';
 import { MovementModal, NewProductModal } from '../components/InventoryModals.tsx';
 import type { InvPerms } from '../components/InventoryModals.tsx';
+import { SellerPickModal } from '../components/SellerPickModal.tsx';
 import { DiscountModal, PaymentModal, VariantChoiceModal } from '../components/SaleModals.tsx';
 import type { PaidResult } from '../components/SaleModals.tsx';
 import { call, errorText } from '../lib/api.ts';
+import { lineTitle, maxQty, stockView } from '../lib/cart.ts';
 import { dateTime, money } from '../lib/format.ts';
 import { beepError, beepOk } from '../lib/sound.ts';
 import { useApp } from '../state/AppState.tsx';
@@ -38,7 +42,12 @@ export function PosScreen() {
   const [choices, setChoices] = useState<CatalogHit[] | null>(null);
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<CatalogHit[]>([]);
+  const [pickSeller, setPickSeller] = useState(false);
+  const [seller, setSeller] = useState<SellerRow | null>(null);
   const [payOpen, setPayOpen] = useState(false);
+  const [extraCategories, setExtraCategories] = useState<string[]>([...DEFAULT_EXTRA_CATEGORIES]);
+  const [extraFor, setExtraFor] = useState<string | null>(null);
+  const [previewSaleId, setPreviewSaleId] = useState<{ id: string; auto: boolean; fresh: boolean } | null>(null);
   const [discountOpen, setDiscountOpen] = useState(false);
   const [cash, setCash] = useState<CashStatus | null>(null);
   const [perms, setPerms] = useState<InvPerms | null>(null);
@@ -62,6 +71,7 @@ export function PosScreen() {
   useEffect(() => {
     loadCash();
     call('inventory:permissions').then(setPerms).catch(() => undefined);
+    call('extras:get').then((r) => setExtraCategories(r.categories)).catch(() => undefined);
     Promise.all([call('catalog:branches'), call('device:get')])
       .then(([b, d]) => {
         setBranches(b);
@@ -79,6 +89,22 @@ export function PosScreen() {
       setMovement(hit);
     },
     [],
+  );
+
+  /** Agrega al carrito SOLO si hay existencia; si no, lo dice claro (nunca se vende en 0 ni de más). */
+  const addToCart = useCallback(
+    (hit: CatalogHit) => {
+      const r = pos.addHit(hit);
+      if (!r.ok) {
+        beepError();
+        showFlash({ kind: 'error', text: r.message });
+        return;
+      }
+      const sv = stockView(hit.qty);
+      showFlash(sv.inherited ? { kind: 'warn', text: `${hit.productName} - ${hit.label} agregado. ${sv.notice}` } : { kind: 'ok', text: `${hit.productName} - ${hit.label} agregado.` });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [pos.addHit, showFlash],
   );
 
   const handleCode = useCallback(
@@ -112,12 +138,10 @@ export function PosScreen() {
       const hit = hits[0]!;
       beepOk();
       if (pos.mode === 'inventario') return openInventoryFor(hit);
-      pos.addHit(hit);
-      if (hit.qty <= 0) showFlash({ kind: 'warn', text: `${hit.productName} ${hit.label}: el sistema no tiene existencia registrada. Se agregó de todos modos.` });
-      else showFlash({ kind: 'ok', text: `${hit.productName} - ${hit.label} agregado.` });
+      addToCart(hit);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [pos.mode, pos.addHit, perms, showFlash, openInventoryFor],
+    [pos.mode, addToCart, perms, showFlash, openInventoryFor],
   );
 
   useScanHandler((code) => void handleCode(code));
@@ -139,35 +163,22 @@ export function PosScreen() {
     setQuery('');
     setResults([]);
     if (pos.mode === 'inventario') openInventoryFor(h);
-    else pos.addHit(h);
+    else addToCart(h);
   };
 
-  // ───────────── Cobro e impresión ─────────────
-  const printSale = useCallback(
-    async (saleId: string, opts: { reprint?: boolean; copies?: ('cliente' | 'tienda')[] } = {}) => {
-      pos.patchLastSale(saleId, { print: 'imprimiendo', printResult: null });
-      try {
-        const r = await call('print:ticket', { saleId, reprint: opts.reprint, copies: opts.copies });
-        pos.patchLastSale(saleId, { print: r.ok ? 'ok' : 'error', printResult: r });
-      } catch (e) {
-        pos.patchLastSale(saleId, { print: 'error', printResult: { ok: false, printedCopies: [], error: errorText(e) } });
-      }
-    },
-    [pos],
-  );
-
+  // ───────────── Cobro ─────────────
   const onPaid = (r: PaidResult) => {
     setPayOpen(false);
+    setSeller(null);
     pos.clearCart();
     loadCash();
+    pos.setLastSale({ sale: r.sale, warnings: r.warnings });
     if (r.duplicate) {
       toast('info', `Esa venta ya estaba guardada (folio ${r.sale.folio}). No se duplicó.`);
-      pos.setLastSale({ sale: r.sale, warnings: [], print: 'omitida', printResult: null });
       return;
     }
-    // La venta YA está guardada en SQLite. Ahora se imprime; si falla, la venta sigue ahí y se reimprime.
-    pos.setLastSale({ sale: r.sale, warnings: r.warnings, print: settings?.autoPrint === false ? 'omitida' : 'imprimiendo', printResult: null });
-    if (settings?.autoPrint !== false) void printSale(r.sale.id);
+    // La venta YA está guardada en SQLite. Se abre la vista previa del ticket; imprimir (o reimprimir) nunca crea otra venta.
+    setPreviewSaleId({ id: r.sale.id, auto: settings?.autoPrint === true, fresh: true });
   };
 
   const clearCart = async () => {
@@ -205,7 +216,9 @@ export function PosScreen() {
                 {results.map((h) => (
                   <button key={h.variantId} className="result" onClick={() => pickResult(h)}>
                     <span><strong>{h.productName}</strong> - {h.label}</span>
-                    <span className="muted">{money(h.priceCents)} - existencia {h.qty}</span>
+                    <span className={stockView(h.qty).soldOut && !inventoryMode ? 'neg' : 'muted'}>
+                      {money(h.priceCents)} - {stockView(h.qty).text}{stockView(h.qty).inherited ? ' (por corregir)' : ''}
+                    </span>
                   </button>
                 ))}
               </div>
@@ -231,25 +244,43 @@ export function PosScreen() {
                     <tr><th>Producto</th><th className="num">Precio</th><th className="center">Cantidad</th><th className="num">Importe</th><th /></tr>
                   </thead>
                   <tbody>
-                    {pos.lines.map((l) => (
-                      <tr key={l.variantId}>
-                        <td>
-                          <div className="cell-main">{l.productName}</div>
-                          <div className="muted small">{l.label} - {l.code}</div>
-                          {l.stockQty < l.qty && <div className="warn-text small">Existencia registrada: {l.stockQty}</div>}
-                        </td>
-                        <td className="num">{money(l.unitPriceCents)}</td>
-                        <td className="center">
-                          <div className="qty">
-                            <button className="btn btn-sm" onClick={() => pos.setQty(l.variantId, l.qty - 1)} disabled={l.qty <= 1} aria-label="Quitar uno">-</button>
-                            <span className="qty-n">{l.qty}</span>
-                            <button className="btn btn-sm" onClick={() => pos.setQty(l.variantId, l.qty + 1)} aria-label="Agregar uno">+</button>
-                          </div>
-                        </td>
-                        <td className="num strong">{money(l.qty * l.unitPriceCents)}</td>
-                        <td className="num"><button className="btn btn-quiet btn-sm" onClick={() => pos.remove(l.variantId)}>Quitar</button></td>
-                      </tr>
-                    ))}
+                    {pos.lines.map((l) =>
+                      l.kind === 'extra' ? (
+                        <tr key={l.key} className="line-extra">
+                          <td>
+                            <div className="cell-main"><span className="chip chip-info">Extra</span> {lineTitle(l)}</div>
+                            <div className="muted small">sobre {l.productName} - {l.label}</div>
+                          </td>
+                          <td className="num">{money(l.unitPriceCents)}</td>
+                          <td className="center muted">1</td>
+                          <td className="num strong">{money(l.unitPriceCents)}</td>
+                          <td className="num"><button className="btn btn-quiet btn-sm" onClick={() => pos.remove(l.key)}>Quitar</button></td>
+                        </tr>
+                      ) : (
+                        <tr key={l.key}>
+                          <td>
+                            <div className="cell-main">{l.productName}</div>
+                            <div className="muted small">{l.label} - {l.code}</div>
+                            {l.qty >= maxQty(l) && <div className="warn-text small">Es todo lo que hay en existencia ({maxQty(l)}).</div>}
+                          </td>
+                          <td className="num">{money(l.unitPriceCents)}</td>
+                          <td className="center">
+                            <div className="qty">
+                              <button className="btn btn-sm" onClick={() => pos.setQty(l.key, l.qty - 1)} disabled={l.qty <= 1} aria-label="Quitar uno">-</button>
+                              <span className="qty-n">{l.qty}</span>
+                              <button className="btn btn-sm" onClick={() => pos.setQty(l.key, l.qty + 1)} disabled={l.qty >= maxQty(l)} aria-label="Agregar uno">+</button>
+                            </div>
+                          </td>
+                          <td className="num strong">{money(l.qty * l.unitPriceCents)}</td>
+                          <td className="num">
+                            <div className="row-gap row-end">
+                              {isExtraCategory(l.category, extraCategories) && <button className="btn btn-sm" onClick={() => setExtraFor(l.key)}>Extra</button>}
+                              <button className="btn btn-quiet btn-sm" onClick={() => pos.remove(l.key)}>Quitar</button>
+                            </div>
+                          </td>
+                        </tr>
+                      ),
+                    )}
                   </tbody>
                 </table>
               )}
@@ -272,7 +303,7 @@ export function PosScreen() {
             <div className="row-between"><span>Subtotal</span><span>{money(pos.subtotalCents)}</span></div>
             {pos.discountCents > 0 && <div className="row-between"><span>Descuento</span><span>-{money(pos.discountCents)}</span></div>}
             <div className="total-big"><span>TOTAL</span><strong>{money(pos.totalCents)}</strong></div>
-            <button className="btn btn-gold btn-xl btn-block" disabled={inventoryMode || pos.lines.length === 0} onClick={() => setPayOpen(true)}>
+            <button className="btn btn-gold btn-xl btn-block" disabled={inventoryMode || pos.lines.length === 0} onClick={() => setPickSeller(true)}>
               Cobrar
             </button>
             <div className="row-gap">
@@ -295,30 +326,54 @@ export function PosScreen() {
                 <div className="change change-sm"><span>Cambio entregado</span><strong>{money(last.sale.changeCents)}</strong></div>
               )}
               {last.warnings.map((w) => <div key={w} className="warn-text small">{w}</div>)}
-              {last.print === 'imprimiendo' && <Banner kind="info">Imprimiendo copia cliente y copia tienda...</Banner>}
-              {last.print === 'ok' && <Banner kind="ok">Se imprimieron las dos copias.</Banner>}
-              {last.print === 'omitida' && <div className="muted small">Impresión automática desactivada.</div>}
-              {last.print === 'error' && (
-                <Banner kind="error">
-                  La venta SÍ quedó guardada, pero no se pudo imprimir. {last.printResult?.error}
-                  {last.printResult && last.printResult.printedCopies.length > 0 && ` (Ya salió la copia ${last.printResult.printedCopies.join(' y ')}.)`}
-                </Banner>
-              )}
               <div className="row-gap">
-                <button className="btn" disabled={last.print === 'imprimiendo'} onClick={() => void printSale(last.sale.id, { reprint: true })}>Reimprimir</button>
-                {last.print === 'error' && last.printResult?.printedCopies.length === 1 && (
-                  <button className="btn" onClick={() => void printSale(last.sale.id, { reprint: true, copies: [last.printResult!.printedCopies[0] === 'cliente' ? 'tienda' : 'cliente'] })}>
-                    Imprimir solo la copia que falta
-                  </button>
-                )}
+                <button className="btn btn-gold" onClick={() => setPreviewSaleId({ id: last.sale.id, auto: false, fresh: false })}>Ver ticket / Imprimir</button>
               </div>
             </div>
           )}
         </aside>
       </div>
 
-      {payOpen && (
-        <PaymentModal totalCents={pos.totalCents} discountCents={pos.discountCents} lines={pos.lines} onClose={() => setPayOpen(false)} onPaid={onPaid} />
+      {pickSeller && (
+        <SellerPickModal
+          onClose={() => setPickSeller(false)}
+          onPick={(sel) => {
+            setPickSeller(false);
+            setSeller(sel);
+            setPayOpen(true);
+          }}
+        />
+      )}
+      {payOpen && seller && (
+        <PaymentModal
+          totalCents={pos.totalCents}
+          discountCents={pos.discountCents}
+          lines={pos.lines}
+          seller={seller}
+          onClose={() => { setPayOpen(false); setSeller(null); }}
+          onPaid={onPaid}
+        />
+      )}
+      {extraFor && (
+        <ExtraModal
+          productName={pos.lines.find((l) => l.key === extraFor)?.productName ?? ''}
+          onClose={() => setExtraFor(null)}
+          onAdd={(cents, note) => {
+            const r = pos.addExtra(extraFor, cents, note);
+            if (!r.ok) return r.message;
+            setExtraFor(null);
+            return null;
+          }}
+        />
+      )}
+      {previewSaleId && (
+        <DocPreviewModal
+          doc={{ kind: 'ticket', saleId: previewSaleId.id }}
+          title="Ticket de la venta"
+          autoPrint={previewSaleId.auto}
+          intro={previewSaleId.fresh ? 'Venta guardada. Revisa el ticket y pulsa Imprimir.' : undefined}
+          onClose={() => setPreviewSaleId(null)}
+        />
       )}
       {discountOpen && (
         <DiscountModal
@@ -335,7 +390,7 @@ export function PosScreen() {
           onPick={(h) => {
             setChoices(null);
             if (pos.mode === 'inventario') openInventoryFor(h);
-            else pos.addHit(h);
+            else addToCart(h);
           }}
         />
       )}

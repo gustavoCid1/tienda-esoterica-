@@ -10,6 +10,7 @@ import { newId } from '@amara/shared';
 import type { BranchRow, VariantRow } from '../../shared/ipc.ts';
 import { call, errorText } from '../lib/api.ts';
 import { MOVEMENT_LABEL, money, parsePesos } from '../lib/format.ts';
+import { stockView } from '../lib/cart.ts';
 import { useFeedback } from '../state/Feedback.tsx';
 import { Banner, Field } from './Field.tsx';
 import { Modal } from './Modal.tsx';
@@ -142,12 +143,16 @@ export function MovementModal({
           <Field label="Variante">
             <select className="inp" value={variantId} onChange={(e) => { setVariantId(e.target.value); setLocationTouched(false); }} disabled={readOnly && variants.length < 2}>
               {variants.length === 0 && <option value={initial.variantId}>{initial.label}</option>}
-              {variants.map((v) => <option key={v.variantId} value={v.variantId}>{v.label} ({v.qty} en existencia)</option>)}
+              {variants.map((v) => <option key={v.variantId} value={v.variantId}>{v.label} ({stockView(v.qty).soldOut ? 'sin existencia' : `${stockView(v.qty).shown} en existencia`})</option>)}
             </select>
           </Field>
         </div>
         <div className="stat-row">
-          <div><span className="muted">Existencia actual</span><div className="stat-big">{currentQty}</div></div>
+          <div>
+            <span className="muted">Existencia actual</span>
+            <div className="stat-big">{stockView(currentQty).shown}</div>
+            {stockView(currentQty).inherited && <div className="warn-text small">Existencia por corregir (el sistema tenía un saldo negativo). Haz un conteo físico.</div>}
+          </div>
           <div><span className="muted">Precio</span><div className="stat-big">{money(current?.priceCents ?? initial.priceCents)}</div></div>
           <div><span className="muted">Código</span><div className="mono">{current?.internalCode ?? initial.internalCode}</div></div>
         </div>
@@ -169,8 +174,8 @@ export function MovementModal({
             {qtyOk && (
               <div className="preview">
                 {type === 'conteo' ? `Diferencia contra el sistema: ${q - currentQty >= 0 ? '+' : ''}${q - currentQty}. ` : ''}
-                Existencia resultante: <strong>{resulting}</strong>
-                {resulting < 0 && <span className="neg"> (quedaría negativa)</span>}
+                Existencia resultante: <strong>{Math.max(0, resulting)}</strong>
+                {resulting < 0 && <span className="neg"> (no puede quedar por debajo de cero: revisa la cantidad)</span>}
               </div>
             )}
             <div className="grid2">

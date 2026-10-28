@@ -1,4 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
+import { hashTokenCode } from '@amara/shared';
+import type { CachedSecurityToken } from '@amara/shared';
 import { createDb, fromSyncSqlite, OPEN_PRAGMAS } from '../src/db.ts';
 import { LocalStore } from '../src/local-store.ts';
 import type { Actor, PullPayload } from '../src/types.ts';
@@ -13,6 +15,20 @@ export const V_GR = 'bbbbbbb2-0000-4000-8000-000000000002'; // Vela grande
 export const gerente: Actor = { userId: 'cccccccc-0000-4000-8000-000000000001', userName: 'Gerente', role: 'gerente' };
 export const vendedor: Actor = { userId: 'cccccccc-0000-4000-8000-000000000002', userName: 'Vendedora', role: 'vendedor' };
 export const dev: Actor = { userId: 'cccccccc-0000-4000-8000-000000000003', userName: 'Dev', role: 'desarrollador' };
+
+/** Verificador falso para pruebas (scrypt necesita @noble/hashes): el "hash" de una contraseña es `fake$<contraseña>`. */
+export const fakeVerify = (password: string, stored: string) => stored === `fake$${password}`;
+export const ADMIN_PASSWORD = 'clave-de-gerente';
+
+/** Token de la caché tal como llega en el pull (solo sal + hash). Vigente 30 min desde 2026-10-22T16:00Z por omisión. */
+export function cachedToken(code: string, over: Partial<CachedSecurityToken> = {}): CachedSecurityToken {
+  const salt = over.salt ?? 'sal-prueba';
+  return {
+    id: 'tok-0001', label: 'Token de prueba', purposes: ['cierre_caja', 'devolucion', 'cancelacion', 'limpias'], branchId: B1, forUserId: null,
+    createdBy: gerente.userId, createdAt: '2026-10-22T15:30:00.000Z', expiresAt: '2026-10-22T17:00:00.000Z', revokedAt: null, maxUses: null, usedCount: 0,
+    salt, hash: hashTokenCode(code, salt), ...over,
+  };
+}
 
 export class Clock {
   t: number;
@@ -46,7 +62,7 @@ export function pullPayload(): PullPayload {
       { variantId: V_GR, branchId: B2, qty: 7 },
     ],
     users: [
-      { id: gerente.userId, username: 'gerente', name: 'Gerente', role: 'gerente', branchIds: [B1, B2], active: true },
+      { id: gerente.userId, username: 'gerente', name: 'Gerente', role: 'gerente', branchIds: [B1, B2], active: true, verifier: `fake$${ADMIN_PASSWORD}` },
       { id: vendedor.userId, username: 'vendedora', name: 'Vendedora', role: 'vendedor', branchIds: [B1], active: true },
     ],
     grants: [],
@@ -57,7 +73,7 @@ export async function newStore(opts: { path?: string; clock?: Clock } = {}) {
   const raw = new DatabaseSync(opts.path ?? ':memory:');
   raw.exec(OPEN_PRAGMAS);
   const clock = opts.clock ?? new Clock();
-  const store = new LocalStore(createDb(fromSyncSqlite(raw)), { now: clock.now });
+  const store = new LocalStore(createDb(fromSyncSqlite(raw)), { now: clock.now, verifyPassword: fakeVerify });
   await store.migrate();
   return { store, raw, clock };
 }

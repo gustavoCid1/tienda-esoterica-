@@ -38,8 +38,12 @@ export interface Terminal {
   branchId: string;
   kind: 'escritorio' | 'movil';
   active?: boolean;
+  /** La API v1 manda `revoked` (booleano); otras versiones `revokedAt`. Ver isTerminalRevoked. */
+  revoked?: boolean;
   revokedAt?: string | null;
   lastSyncAt?: string | null;
+  /** v2: persona a quien se asignó la terminal. */
+  assignedTo?: string | null;
 }
 
 export interface AdminUser {
@@ -192,6 +196,11 @@ export interface BackupRow {
   sizeBytes?: number;
   location?: string;
   detail?: string;
+  /** Forma real de la API v1: `at` en lugar de `createdAt`, `ok` en lugar de `status`, `dir` como ubicación. */
+  at?: string;
+  ok?: boolean;
+  dir?: string;
+  files?: { bytes?: number }[];
 }
 
 export interface SyncTerminalStatus {
@@ -202,6 +211,8 @@ export interface SyncTerminalStatus {
   branchId?: string;
   lastSyncAt?: string | null;
   pendingOps?: number;
+  /** Nombre real que envía la API v1. */
+  pendingEvents?: number;
   openConflicts?: number;
 }
 
@@ -230,6 +241,8 @@ export interface Page<T> {
 export interface DashboardPrefs {
   order: string[];
   hidden: string[];
+  /** v2: tipo de gráfica de productos más vendidos (line | bar | pie), guardado por usuario. */
+  chartKind?: 'line' | 'bar' | 'pie';
 }
 
 export type { Sale, SalesSummary };

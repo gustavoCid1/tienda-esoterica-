@@ -6,7 +6,7 @@ import type { SyncOp, SyncResult } from '@amara/shared';
 import type { PullPayload } from '@amara/database';
 import { runSyncCycle, NonceCache, verifyLanRequest, verifyPairing, LanClient, SyncHttpError } from '../src/index.ts';
 import type { SyncApi, PushRequest, PushResponse, PullQuery } from '../src/index.ts';
-import { B1, T1, V_CH, vendedor, gerente, readyStore, pullPayload } from '../../database/test/helpers.ts';
+import { B1, T1, V_CH, vendedor, gerente, readyStore, pullPayload, cachedToken } from '../../database/test/helpers.ts';
 
 /** Servidor simulado: aplica cada opId una sola vez y mantiene su propio inventario. */
 class FakeServer implements SyncApi {
@@ -197,4 +197,38 @@ test('LAN: vinculación con QR, firma de peticiones, replay y revocación', asyn
   const bad = verifyPairing({ hmac, secret: 'otro', deviceId: 'tel-2', ts: Date.now(), proof: 'abc', nowMs: Date.now() });
   assert.equal(bad.ok, false);
   void gerente;
+});
+
+// ───────────────────────────── v2 ─────────────────────────────
+
+test('v2: el ciclo baja tokens y configuración; sin internet después, el token se valida con la caché', async () => {
+  const { store } = await readyStore();
+  const server = new FakeServer();
+  server.pull = async () => {
+    const p = pullPayload();
+    p.securityTokens = [cachedToken('ABCD2345')];
+    p.settings = { extraCategories: ['Veladoras', 'Cristales'] };
+    return p;
+  };
+  const rep = await runSyncCycle(store, server, { branchId: B1, terminalId: T1 });
+  assert.equal(rep.pulled, true);
+  assert.deepEqual(await store.getExtraCategories(), ['Veladoras', 'Cristales']);
+  server.down = true; // se va el internet
+  const v = await store.verifyActionAuthorization({ code: 'abcd2345', purpose: 'cierre_caja', branchId: B1 });
+  assert.ok(v.ok);
+});
+
+test('v2: una operación con autorización inválida llega como conflicto "autorizacion_invalida" y NO se borra', async () => {
+  const { store } = await readyStore();
+  const p = pullPayload();
+  p.securityTokens = [cachedToken('ABCD2345')];
+  await store.applyPull(p);
+  const res = await store.closeCash({ actor: vendedor, terminalId: T1, countedCents: 100000, authorization: { kind: 'token', tokenId: 'tok-0001' } });
+  const closeOp = (await store.nextPending()).find((o) => o.type === 'cash.close')!;
+  await store.markAck({ opId: closeOp.opId, status: 'conflict', conflictKind: 'autorizacion_invalida', detail: 'El token estaba revocado', receivedAt: new Date().toISOString() });
+  const open = await store.openConflicts();
+  assert.equal(open[0].kind, 'autorizacion_invalida');
+  const row = await store.db.get<any>('SELECT status, reconciliation FROM cash_sessions WHERE id = ?', [res.sessionId]);
+  assert.equal(row.status, 'cerrada', 'el corte ya ocurrido no se deshace');
+  assert.equal(row.reconciliation, 'con_diferencias');
 });

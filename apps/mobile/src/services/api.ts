@@ -26,7 +26,7 @@ export class ApiClient {
     this.o = o;
   }
 
-  async request<T>(method: 'GET' | 'POST' | 'PATCH', path: string, opts: { body?: unknown; auth?: boolean; timeoutMs?: number } = {}): Promise<T> {
+  async request<T>(method: 'GET' | 'POST' | 'PATCH' | 'PUT', path: string, opts: { body?: unknown; auth?: boolean; timeoutMs?: number; headers?: Record<string, string> } = {}): Promise<T> {
     const base = this.o.getBaseUrl().trim().replace(/\/+$/, '');
     if (!base) throw new ApiError(0, 'Falta la dirección del servidor. Escríbela en "Servidor".');
     const token = opts.auth === false ? null : await this.o.getToken();
@@ -35,7 +35,7 @@ export class ApiClient {
     try {
       const res = await fetch(`${base}${path}`, {
         method,
-        headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+        headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}), ...(opts.headers ?? {}) },
         body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
         signal: ctrl.signal,
       });
@@ -63,7 +63,12 @@ export class ApiClient {
     return this.request<T>('GET', path, opts);
   }
 
-  post<T>(path: string, body?: unknown, opts?: { auth?: boolean; timeoutMs?: number }): Promise<T> {
+  post<T>(path: string, body?: unknown, opts?: { auth?: boolean; timeoutMs?: number; headers?: Record<string, string> }): Promise<T> {
     return this.request<T>('POST', path, { body, ...opts });
+  }
+
+  /** v2. PUT (categorías de Extras). */
+  put<T>(path: string, body?: unknown, opts?: { timeoutMs?: number; headers?: Record<string, string> }): Promise<T> {
+    return this.request<T>('PUT', path, { body, ...opts });
   }
 }

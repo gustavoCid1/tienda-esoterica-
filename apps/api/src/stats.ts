@@ -78,6 +78,7 @@ export function toReportSale(s: Doc): ReportSale {
     payments: (s.payments ?? []).map((p: Doc) => ({ method: p.method, amountCents: p.amountCents })),
     items: (s.items ?? []).map((i: Doc) => ({
       variantId: i.variantId, productName: i.productName, variantLabel: i.variantLabel, qty: i.qty, unitCostCents: i.unitCostCents, netCents: i.netCents,
+      kind: i.kind === 'extra' ? 'extra' : 'producto',
     })),
   };
 }
@@ -93,6 +94,7 @@ export function toReportAdjustment(a: Doc): ReportAdjustment {
     payments: (a.payments ?? []).map((p: Doc) => ({ method: p.method, amountCents: p.amountCents })),
     items: (a.items ?? []).map((i: Doc) => ({
       variantId: i.variantId, productName: i.productName, variantLabel: i.variantLabel, qty: i.qty, unitCostCents: i.unitCostCents, netCents: i.netCents, restock: i.restock,
+      kind: i.kind === 'extra' ? 'extra' : 'producto',
     })),
   };
 }
@@ -267,5 +269,202 @@ export function buildDashboard(
     bestMonth: best,
     daily: dailySeries(sales, adjustments, range.fromDay, range.toDay),
     byBranch: totalsByBranch(sales, adjustments, branchNames),
+  };
+}
+
+// ───────────────────────────── v2: existencias bajas ─────────────────────────────
+
+export interface LowStockItem {
+  variantId: string;
+  productId: string;
+  productName: string;
+  label: string;
+  category: string;
+  branchId: string;
+  qty: number;
+  minStock: number;
+}
+
+export interface VariantInfo {
+  productId: string;
+  productName: string;
+  label: string;
+  category: string;
+  minStock: number;
+  active: boolean;
+}
+
+/**
+ * Variantes activas en o por debajo de su mínimo configurado (mínimo > 0), y cualquier existencia negativa heredada
+ * (aunque no tenga mínimo). Orden por urgencia: primero lo negativo, luego el menor cociente existencia/mínimo.
+ */
+export function lowStockItems(rows: { variantId: string; branchId: string; qty: number }[], variants: Map<string, VariantInfo>): LowStockItem[] {
+  const items: LowStockItem[] = [];
+  for (const r of rows) {
+    const v = variants.get(r.variantId);
+    if (!v || !v.active) continue;
+    if (!(r.qty < 0 || (v.minStock > 0 && r.qty <= v.minStock))) continue;
+    items.push({ variantId: r.variantId, productId: v.productId, productName: v.productName, label: v.label, category: v.category, branchId: r.branchId, qty: r.qty, minStock: v.minStock });
+  }
+  const urgency = (i: LowStockItem) => (i.qty < 0 ? -1e9 + i.qty : i.minStock > 0 ? i.qty / i.minStock : 0);
+  return items.sort((a, b) => urgency(a) - urgency(b) || a.productName.localeCompare(b.productName, 'es') || a.label.localeCompare(b.label, 'es'));
+}
+
+// ───────────────────────────── v2: series por producto ─────────────────────────────
+
+export type Granularity = 'day' | 'month';
+
+export interface ProductRef {
+  productId: string;
+  productName: string;
+}
+
+/** variantId → producto. Si la variante ya no existe se usa la propia variante y el nombre guardado en la venta. */
+export type ProductResolver = (variantId: string, savedName: string) => ProductRef;
+
+export function resolverFrom(variants: Map<string, { productId: string; productName: string }>): ProductResolver {
+  return (variantId, savedName) => {
+    const v = variants.get(variantId);
+    return v ? { productId: v.productId, productName: v.productName } : { productId: variantId, productName: savedName };
+  };
+}
+
+export const bucketOf = (g: Granularity, iso: string) => (g === 'day' ? mxDayKey(iso) : mxMonthKey(iso));
+
+/** Cubetas del rango (todas, incluso vacías), en orden. */
+export function bucketsInRange(g: Granularity, fromDay: string, toDay: string): string[] {
+  const out: string[] = [];
+  if (g === 'day') for (let d = fromDay; d <= toDay; d = addDays(d, 1)) out.push(d);
+  else for (let d = monthStart(fromDay); d <= toDay; d = addMonths(d, 1)) out.push(d.slice(0, 7));
+  return out;
+}
+
+interface Acc { name: string; qty: number; netCents: number }
+
+/** Unidades e importe netos por cubeta y producto. Los extras suman importe, no unidades; las devoluciones restan en SU fecha. */
+function aggregate(
+  sales: ReportSale[],
+  adjustments: ReportAdjustment[],
+  resolve: ProductResolver,
+  g: Granularity,
+  keep: (ref: ProductRef, variantId: string) => boolean = () => true,
+): Map<string, Map<string, Acc>> {
+  const byBucket = new Map<string, Map<string, Acc>>();
+  const bump = (iso: string, variantId: string, savedName: string, qty: number, cents: number) => {
+    const ref = resolve(variantId, savedName);
+    if (!keep(ref, variantId)) return;
+    const b = bucketOf(g, iso);
+    const m = byBucket.get(b) ?? byBucket.set(b, new Map()).get(b)!;
+    const cur = m.get(ref.productId) ?? { name: ref.productName, qty: 0, netCents: 0 };
+    cur.qty += qty;
+    cur.netCents += cents;
+    m.set(ref.productId, cur);
+  };
+  for (const s of sales) for (const i of s.items) bump(s.createdAt, i.variantId, i.productName, i.kind === 'extra' ? 0 : i.qty, i.netCents);
+  for (const a of adjustments) for (const i of a.items) bump(a.createdAt, i.variantId, i.productName, i.kind === 'extra' ? 0 : -i.qty, -i.netCents);
+  return byBucket;
+}
+
+export interface TopProductsSeries {
+  buckets: { bucket: string; topProduct: { name: string; qty: number } | null; products: { productId: string; name: string; qty: number; netCents: number }[] }[];
+  series: { productId: string; name: string; points: { bucket: string; qty: number; netCents: number }[] }[];
+}
+
+/**
+ * Productos más vendidos por cubeta (día o mes) y la serie de los `limit` productos más vendidos de TODO el rango,
+ * con un punto por cubeta (ceros incluidos) para graficarlos como líneas.
+ */
+export function topProductsSeries(
+  sales: ReportSale[],
+  adjustments: ReportAdjustment[],
+  resolve: ProductResolver,
+  p: { granularity: Granularity; fromDay: string; toDay: string; limit: number },
+): TopProductsSeries {
+  const agg = aggregate(sales, adjustments, resolve, p.granularity);
+  const order = (a: { qty: number; netCents: number; name: string }, b: { qty: number; netCents: number; name: string }) =>
+    b.qty - a.qty || b.netCents - a.netCents || a.name.localeCompare(b.name, 'es');
+
+  const total = new Map<string, Acc>();
+  for (const m of agg.values()) {
+    for (const [id, a] of m) {
+      const cur = total.get(id) ?? { name: a.name, qty: 0, netCents: 0 };
+      cur.qty += a.qty;
+      cur.netCents += a.netCents;
+      total.set(id, cur);
+    }
+  }
+  const top = [...total.entries()].map(([productId, a]) => ({ productId, ...a })).filter((x) => x.qty > 0).sort(order).slice(0, p.limit);
+
+  const keys = bucketsInRange(p.granularity, p.fromDay, p.toDay);
+  const buckets = keys.map((bucket) => {
+    const products = [...(agg.get(bucket) ?? new Map<string, Acc>()).entries()]
+      .map(([productId, a]) => ({ productId, name: a.name, qty: a.qty, netCents: a.netCents }))
+      .filter((x) => x.qty > 0)
+      .sort(order)
+      .slice(0, p.limit);
+    return { bucket, topProduct: products[0] ? { name: products[0].name, qty: products[0].qty } : null, products };
+  });
+  const series = top.map((t) => ({
+    productId: t.productId,
+    name: t.name,
+    points: keys.map((bucket) => {
+      const a = agg.get(bucket)?.get(t.productId);
+      return { bucket, qty: a?.qty ?? 0, netCents: a?.netCents ?? 0 };
+    }),
+  }));
+  return { buckets, series };
+}
+
+export interface ProductSeries {
+  points: { bucket: string; qty: number; netCents: number }[];
+  totalQty: number;
+  totalNetCents: number;
+  last: { saleId: string; folio: string; createdAt: string; qty: number; netCents: number }[];
+}
+
+/**
+ * Serie de UN producto (productId) o UNA variante (variantId): unidades e importe netos por cubeta, totales del rango
+ * y las últimas ventas del mes de `toDay` donde apareció (con sus unidades e importe en esa venta).
+ */
+export function productSeries(
+  sales: ReportSale[],
+  adjustments: ReportAdjustment[],
+  resolve: ProductResolver,
+  folios: Map<string, string>,
+  p: { productId?: string; variantId?: string; granularity: Granularity; fromDay: string; toDay: string; lastLimit?: number },
+): ProductSeries {
+  const keep = (ref: ProductRef, variantId: string) => (p.variantId ? variantId === p.variantId : ref.productId === p.productId);
+  const agg = aggregate(sales, adjustments, resolve, p.granularity, keep);
+  const points = bucketsInRange(p.granularity, p.fromDay, p.toDay).map((bucket) => {
+    let qty = 0;
+    let netCents = 0;
+    for (const a of agg.get(bucket)?.values() ?? []) {
+      qty += a.qty;
+      netCents += a.netCents;
+    }
+    return { bucket, qty, netCents };
+  });
+
+  const month = p.toDay.slice(0, 7);
+  const last: ProductSeries['last'] = [];
+  for (const s of sales) {
+    if (mxMonthKey(s.createdAt) !== month) continue;
+    let qty = 0;
+    let netCents = 0;
+    let hit = false;
+    for (const i of s.items) {
+      if (!keep(resolve(i.variantId, i.productName), i.variantId)) continue;
+      hit = true;
+      qty += i.kind === 'extra' ? 0 : i.qty;
+      netCents += i.netCents;
+    }
+    if (hit) last.push({ saleId: s.id, folio: folios.get(s.id) ?? s.id, createdAt: s.createdAt, qty, netCents });
+  }
+  last.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  return {
+    points,
+    totalQty: points.reduce((a, x) => a + x.qty, 0),
+    totalNetCents: points.reduce((a, x) => a + x.netCents, 0),
+    last: last.slice(0, p.lastLimit ?? 20),
   };
 }

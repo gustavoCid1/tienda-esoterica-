@@ -3,13 +3,14 @@ import { Router } from 'express';
 import type { Request } from 'express';
 import { z } from 'zod';
 import { can, mxTodayKey, newId } from '@amara/shared';
-import type { SaleAdjustment, SyncOp } from '@amara/shared';
-import { paymentMethodSchema, uuid } from '@amara/shared/schemas';
+import type { ActionAuthorization, SaleAdjustment, SyncOp } from '@amara/shared';
+import { actionAuthorizationSchema, paymentMethodSchema, uuid } from '@amara/shared/schemas';
 import { AdjustmentError, buildCancellation, buildReturn } from '../adjustments.ts';
-import { assertBranch, branchScope, requirePerm, requireReauth } from '../auth.ts';
+import { assertBranch, branchScope, requirePerm } from '../auth.ts';
 import { col } from '../db.ts';
 import { ah, HttpError, parse } from '../http.ts';
-import { adjustmentView, saleView } from '../serialize.ts';
+import { authorizeOnline, preflight } from '../online-authz.ts';
+import { adjustmentView, saleView, toTodaySaleSummary } from '../serialize.ts';
 import { applySyncOp } from '../sync-apply.ts';
 import { createMongoSyncRepo } from '../sync-repo.ts';
 import { canSeeCosts, dayRangeIso, dayStr, isoRangeFilter, pageQuery, rejectionToHttp, sessionUser } from '../util.ts';
@@ -42,6 +43,28 @@ salesRouter.get(
       col('sales').find(filter).sort({ createdAt: -1 }).skip(q.offset).limit(q.limit).toArray(),
     ]);
     res.json({ total, items: docs.map((d) => saleView(d, true)) });
+  }),
+);
+
+/**
+ * v2. Tickets de HOY (hora de México) solo con lo vendido, cantidades y precios; sin ticket impreso, pagos ni costos.
+ * Solo gerente. Debe declararse antes de `/:id`.
+ */
+salesRouter.get(
+  '/today-summary',
+  requirePerm('tickets.archivo'),
+  ah(async (req, res) => {
+    const user = sessionUser(req);
+    const q = parse(z.object({ branchId: z.string().optional() }), req.query);
+    const day = mxTodayKey();
+    const range = dayRangeIso(day, day);
+    const docs = await col('sales')
+      .find({ branchId: { $in: branchScope(user, q.branchId) }, ...isoRangeFilter('createdAt', range.from, range.to) })
+      .sort({ createdAt: -1 })
+      .limit(1000)
+      .toArray();
+    const items = docs.map(toTodaySaleSummary);
+    res.json({ day, count: items.length, totalCents: items.filter((i) => i.status !== 'cancelada').reduce((a, i) => a + i.totalCents, 0), items });
   }),
 );
 
@@ -96,9 +119,12 @@ async function pickCashSession(branchId: string, terminalId?: string): Promise<{
   return { sessionId: open[0]?._id ?? null, terminalId: open[0]?.terminalId ?? 'servidor' };
 }
 
-async function applyAdjustment(req: Request, adj: SaleAdjustment) {
+async function applyAdjustment(req: Request, adj: SaleAdjustment, authorization?: ActionAuthorization) {
   const user = sessionUser(req);
-  const op: SyncOp = { opId: adj.id, type: 'sale.adjust', branchId: adj.branchId, terminalId: adj.terminalId, userId: user.id, localTs: adj.createdAt, payload: { adjustment: adj } };
+  const op: SyncOp = {
+    opId: adj.id, type: 'sale.adjust', branchId: adj.branchId, terminalId: adj.terminalId, userId: user.id, localTs: adj.createdAt,
+    payload: { adjustment: adj, ...(authorization ? { authorization } : {}) },
+  };
   const r = await applySyncOp(repo, op, { now: () => new Date(), source: 'servidor' });
   if (r.status === 'rejected') throw rejectionToHttp(r.conflictKind, r.detail);
   return r;
@@ -108,11 +134,10 @@ const asHttp = (e: unknown) => (e instanceof AdjustmentError ? new HttpError(e.s
 
 salesRouter.post(
   '/:id/cancel',
-  requirePerm('ventas.cancelar'),
-  requireReauth,
   ah(async (req, res) => {
     const user = sessionUser(req);
-    const body = parse(z.object({ id: uuid.optional(), reason: z.string().trim().min(3).max(200), terminalId: z.string().optional() }), req.body);
+    await preflight(req, res, 'ventas.cancelar');
+    const body = parse(z.object({ id: uuid.optional(), reason: z.string().trim().min(3).max(200), terminalId: z.string().optional(), authorization: actionAuthorizationSchema.optional() }), req.body);
     const sale = await repo.getSale(req.params.id!);
     if (!sale) throw new HttpError(404, 'Venta no encontrada');
     assertBranch(user, sale.branchId);
@@ -126,20 +151,21 @@ salesRouter.post(
     } catch (e) {
       throw asHttp(e);
     }
-    const r = await applyAdjustment(req, adj);
+    const authorization = await authorizeOnline(req, { perm: 'ventas.cancelar', purpose: 'cancelacion', raw: body.authorization, branchId: sale.branchId });
+    const r = await applyAdjustment(req, adj, authorization);
     res.status(r.status === 'duplicate' ? 200 : 201).json({ ok: true, duplicate: r.status === 'duplicate', adjustment: adj });
   }),
 );
 
 salesRouter.post(
   '/:id/return',
-  requirePerm('ventas.devolver'),
-  requireReauth,
   ah(async (req, res) => {
     const user = sessionUser(req);
+    await preflight(req, res, 'ventas.devolver');
     const body = parse(
       z.object({
         id: uuid.optional(),
+        authorization: actionAuthorizationSchema.optional(),
         reason: z.string().trim().min(3).max(200),
         terminalId: z.string().optional(),
         items: z.array(z.object({ saleItemId: z.string().min(1).max(100), qty: z.number().int().positive(), restock: z.boolean() })).min(1).max(100),
@@ -164,7 +190,8 @@ salesRouter.post(
     } catch (e) {
       throw asHttp(e);
     }
-    await applyAdjustment(req, adj);
+    const authorization = await authorizeOnline(req, { perm: 'ventas.devolver', purpose: 'devolucion', raw: body.authorization, branchId: sale.branchId });
+    await applyAdjustment(req, adj, authorization);
     res.status(201).json({ ok: true, adjustment: adj });
   }),
 );

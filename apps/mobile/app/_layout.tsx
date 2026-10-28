@@ -3,17 +3,19 @@
  * la fase (login -> terminal -> sucursal -> listo). El servidor es quien autoriza de verdad; ocultar o
  * redirigir pantallas aquí es solo comodidad.
  */
-import React, { useEffect } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { ActivityIndicator, Image, StyleSheet, Text, View } from 'react-native';
 import { Stack, useRootNavigationState, useRouter, useSegments } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { AppProvider, useApp } from '../src/state/AppContext';
+import { AlertsProvider } from '../src/state/AlertsContext';
 import { CartProvider } from '../src/state/CartContext';
 import { LOGO_ASPECT, colors, space } from '../src/theme';
 
 function Gate() {
-  const { phase } = useApp();
+  const { phase, session } = useApp();
+  const adminShownFor = useRef<string | null>(null);
   const router = useRouter();
   const segments = useSegments() as string[];
   const navState = useRootNavigationState();
@@ -33,12 +35,19 @@ function Gate() {
         if (first !== 'branch') router.replace('/branch');
         break;
       case 'listo':
-        if (atRoot || first === 'login') router.replace('/home');
+        if (atRoot || first === 'login') {
+          router.replace('/home');
+          // v2: el gerente entra al Panel administrativo (una vez por inicio de sesión); el vendedor no lo ve.
+          if (session?.user.role === 'gerente' && adminShownFor.current !== session.user.id) {
+            adminShownFor.current = session.user.id;
+            setTimeout(() => router.push('/admin'), 0);
+          }
+        }
         break;
       default:
         break;
     }
-  }, [phase, first, navState?.key, router]);
+  }, [phase, first, navState?.key, router, session]);
 
   return null;
 }
@@ -67,6 +76,7 @@ export default function RootLayout() {
     <SafeAreaProvider>
       <AppProvider>
         <CartProvider>
+          <AlertsProvider>
           <StatusBar style="dark" />
           <Gate />
           <Stack
@@ -94,8 +104,19 @@ export default function RootLayout() {
             <Stack.Screen name="summary" options={{ title: 'Resumen de ventas' }} />
             <Stack.Screen name="product-new" options={{ title: 'Alta de producto' }} />
             <Stack.Screen name="about" options={{ title: 'Compatibilidad' }} />
+            <Stack.Screen name="admin" options={{ title: 'Panel administrativo' }} />
+            <Stack.Screen name="notifications" options={{ title: 'Notificaciones' }} />
+            <Stack.Screen name="today" options={{ title: 'Tickets de hoy' }} />
+            <Stack.Screen name="cash" options={{ title: 'Caja' }} />
+            <Stack.Screen name="adjust" options={{ title: 'Devolución o cancelación' }} />
+            <Stack.Screen name="tokens" options={{ title: 'Tokens de seguridad' }} />
+            <Stack.Screen name="limpias" options={{ title: 'Limpias' }} />
+            <Stack.Screen name="extras" options={{ title: 'Extras' }} />
+            <Stack.Screen name="labels" options={{ title: 'Etiquetas' }} />
+            <Stack.Screen name="product-sales" options={{ title: 'Ventas del producto' }} />
           </Stack>
           <Overlay />
+          </AlertsProvider>
         </CartProvider>
       </AppProvider>
     </SafeAreaProvider>

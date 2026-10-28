@@ -23,6 +23,8 @@ export interface ReportSaleItem {
   qty: number;
   unitCostCents: number;
   netCents: number;
+  /** v2. Las líneas 'extra' suman al importe pero NO a unidades vendidas. */
+  kind?: 'producto' | 'extra';
 }
 
 export interface ReportSale {
@@ -44,6 +46,7 @@ export interface ReportAdjustment {
   payments: { method: PaymentMethod; amountCents: number }[];
   items: (Pick<AdjustmentItem, 'variantId' | 'productName' | 'variantLabel' | 'qty' | 'unitCostCents' | 'netCents'> & {
     restock?: boolean;
+    kind?: 'producto' | 'extra';
   })[];
 }
 
@@ -125,9 +128,11 @@ export function summarizeSales(
     gross += s.totalCents;
     for (const p of s.payments) byMethod[p.method].grossCents += p.amountCents;
     for (const it of s.items) {
-      units += it.qty;
-      cogs += it.qty * it.unitCostCents;
-      bump(it.variantId, `${it.productName} ${it.variantLabel}`.trim(), it.qty, it.netCents);
+      // Un extra es ingreso (netCents) pero no una unidad vendida.
+      const u = it.kind === 'extra' ? 0 : it.qty;
+      units += u;
+      cogs += u * it.unitCostCents;
+      bump(it.variantId, `${it.productName} ${it.variantLabel}`.trim(), u, it.netCents);
     }
   }
 
@@ -146,10 +151,11 @@ export function summarizeSales(
     }
     for (const p of a.payments) byMethod[p.method].refundedCents += p.amountCents;
     for (const it of a.items) {
-      units -= it.qty;
+      const u = it.kind === 'extra' ? 0 : it.qty;
+      units -= u;
       // Solo lo que volvió a existencias reduce el costo; lo dañado (restock=false) sigue siendo costo.
-      if (it.restock !== false) cogs -= it.qty * it.unitCostCents;
-      bump(it.variantId, `${it.productName} ${it.variantLabel}`.trim(), -it.qty, -it.netCents);
+      if (it.restock !== false) cogs -= u * it.unitCostCents;
+      bump(it.variantId, `${it.productName} ${it.variantLabel}`.trim(), -u, -it.netCents);
     }
   }
 

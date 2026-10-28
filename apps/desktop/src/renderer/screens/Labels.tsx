@@ -1,13 +1,14 @@
 /**
- * Etiquetas: Code128 (código interno) + QR (buildQrValue). Se arma un lote, se ve la vista previa
- * a tamaño real, se imprime en la impresora de etiquetas y queda en el historial para reimprimir.
+ * Etiquetas: Code128 (código interno) + QR (buildQrValue). Se arma un lote, se eligen qué mostrar (nombre, precio, QR),
+ * se abre un MODAL de vista previa de la hoja con "Imprimir" y "Guardar PDF", y queda en el historial para reimprimir.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { CatalogHit } from '@amara/database';
 import type { LabelBatch, LabelItem } from '../../shared/ipc.ts';
 import { buildLabelSheetHtml, labelInnerHtml, labelRules } from '../../shared/label-html.ts';
-import type { LabelRender } from '../../shared/label-html.ts';
+import type { LabelRender, LabelSheetOptions } from '../../shared/label-html.ts';
 import { Banner, Field } from '../components/Field.tsx';
+import { LabelPreviewModal } from '../components/LabelPreviewModal.tsx';
 import { call, errorText } from '../lib/api.ts';
 import { dateTime, money } from '../lib/format.ts';
 import { expandLabels, makeLabel } from '../lib/labels.ts';
@@ -23,7 +24,10 @@ export function LabelsScreen() {
   const { toast } = useFeedback();
   const { labelQueue, setLabelQueue } = usePos();
   const [items, setItems] = useState<LabelItem[]>([]);
+  const [showName, setShowName] = useState(true);
   const [showPrice, setShowPrice] = useState(true);
+  const [showQr, setShowQr] = useState(true);
+  const [sheet, setSheet] = useState<{ items: LabelItem[]; labels: LabelRender[]; options: LabelSheetOptions; html: string } | null>(null);
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<CatalogHit[]>([]);
   const [previews, setPreviews] = useState<LabelRender[]>([]);
@@ -81,20 +85,16 @@ export function LabelsScreen() {
   const total = useMemo(() => items.reduce((a, i) => a + i.copies, 0), [items]);
   const setCopies = (id: string, v: string) => setItems((prev) => prev.map((i) => (i.variantId === id ? { ...i, copies: Math.max(1, Math.min(500, Math.floor(Number(v)) || 1)) } : i)));
 
-  const printItems = async (list: LabelItem[]) => {
+  const options: LabelSheetOptions = { widthMm: w, heightMm: h, showName, showPrice, showQr };
+
+  /** Arma la hoja y abre la vista previa (el envío a la impresora o el PDF se hacen desde el modal). */
+  const openPreview = async (list: LabelItem[]) => {
     if (busy || list.length === 0) return;
     setBusy(true);
     setError(null);
     try {
       const labels = await expandLabels(list);
-      const html = buildLabelSheetHtml(labels, { widthMm: w, heightMm: h, showPrice });
-      const r = await call('print:labels', { html, widthMm: w, heightMm: h });
-      if (!r.ok) {
-        setError(r.error ?? 'No se pudo imprimir.');
-        return;
-      }
-      toast('ok', `${labels.length} etiqueta(s) enviadas a la impresora.`);
-      setHistory(await call('labels:saveBatch', { items: list }));
+      setSheet({ items: list, labels, options, html: buildLabelSheetHtml(labels, options) });
     } catch (e) {
       setError(errorText(e));
     } finally {
@@ -102,7 +102,17 @@ export function LabelsScreen() {
     }
   };
 
-  const css = labelRules({ widthMm: w, heightMm: h, showPrice }, '.label-preview');
+  const afterPrinted = async () => {
+    const list = sheet?.items ?? [];
+    setSheet(null);
+    try {
+      setHistory(await call('labels:saveBatch', { items: list }));
+    } catch (e) {
+      toast('warn', `Se imprimió, pero no se pudo guardar en el historial: ${errorText(e)}`);
+    }
+  };
+
+  const css = labelRules(options, '.label-preview');
 
   return (
     <div className="page">
@@ -127,7 +137,11 @@ export function LabelsScreen() {
       <div className="card">
         <div className="row-between">
           <h3>Lote actual ({total} etiqueta{total === 1 ? '' : 's'})</h3>
-          <label className="check"><input type="checkbox" checked={showPrice} onChange={(e) => setShowPrice(e.target.checked)} /> Mostrar precio</label>
+          <div className="row-gap">
+            <label className="check"><input type="checkbox" checked={showName} onChange={(e) => setShowName(e.target.checked)} /> Mostrar nombre</label>
+            <label className="check"><input type="checkbox" checked={showPrice} onChange={(e) => setShowPrice(e.target.checked)} /> Mostrar precio</label>
+            <label className="check"><input type="checkbox" checked={showQr} onChange={(e) => setShowQr(e.target.checked)} /> Mostrar QR</label>
+          </div>
         </div>
         {items.length === 0 ? (
           <p className="muted">Agrega productos para armar el lote.</p>
@@ -138,7 +152,7 @@ export function LabelsScreen() {
               {items.map((i, k) => (
                 <div key={i.variantId} className="label-row">
                   <div className="label-preview" style={{ width: `${w}mm`, height: `${h}mm` }}>
-                    {previews[k] && <div className="label" style={{ width: `${w}mm`, height: `${h}mm` }} dangerouslySetInnerHTML={{ __html: labelInnerHtml(previews[k]!, { widthMm: w, heightMm: h, showPrice }) }} />}
+                    {previews[k] && <div className="label" style={{ width: `${w}mm`, height: `${h}mm` }} dangerouslySetInnerHTML={{ __html: labelInnerHtml(previews[k]!, options) }} />}
                   </div>
                   <div className="stack">
                     <div><strong>{i.productName}</strong> - {i.label}</div>
@@ -152,7 +166,7 @@ export function LabelsScreen() {
               ))}
             </div>
             <div className="row-gap">
-              <button className="btn btn-gold btn-lg" onClick={() => void printItems(items)} disabled={busy}>{busy ? 'Enviando...' : `Imprimir ${total} etiqueta${total === 1 ? '' : 's'}`}</button>
+              <button className="btn btn-gold btn-lg" onClick={() => void openPreview(items)} disabled={busy}>{busy ? 'Preparando...' : `Vista previa e imprimir (${total})`}</button>
               <button className="btn" onClick={() => setItems([])} disabled={busy}>Vaciar lote</button>
             </div>
           </>
@@ -170,11 +184,12 @@ export function LabelsScreen() {
             </div>
             <div className="row-gap">
               <button className="btn btn-sm" onClick={() => setItems(b.items)} disabled={busy}>Cargar al lote</button>
-              <button className="btn btn-sm" onClick={() => void printItems(b.items)} disabled={busy}>Reimprimir</button>
+              <button className="btn btn-sm" onClick={() => void openPreview(b.items)} disabled={busy}>Vista previa</button>
             </div>
           </div>
         ))}
       </div>
+      {sheet && <LabelPreviewModal labels={sheet.labels} options={sheet.options} printHtml={sheet.html} onClose={() => setSheet(null)} onPrinted={() => void afterPrinted()} />}
     </div>
   );
 }

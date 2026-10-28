@@ -14,6 +14,7 @@ import { CameraScanner } from '../../src/components/CameraScanner';
 import { ModeBadge, ModeSwitch } from '../../src/components/ModeBadge';
 import { MovementModal } from '../../src/components/MovementModal';
 import { StatusBanner } from '../../src/components/StatusBanner';
+import { isLegacyNegative, shownQty } from '../../src/lib/low-stock';
 import { useApp } from '../../src/state/AppContext';
 import { useCart } from '../../src/state/CartContext';
 import { candidateCodes } from '../../src/lib/scan-codes';
@@ -71,8 +72,11 @@ export default function ScanScreen() {
               setPaused(true);
               setResult({ kind: 'error', message: 'Tu rol no puede vender.' });
             } else {
-              cart.add(hit, 1); // modo VENTA: siempre 1 unidad
-              setResult({ kind: 'added', hit });
+              const blocked = cart.add(hit, 1); // modo VENTA: siempre 1 unidad; no se vende sin existencia ni de más
+              if (blocked) {
+                setPaused(true);
+                setResult({ kind: 'error', message: blocked });
+              } else setResult({ kind: 'added', hit });
             }
           } else {
             setPaused(true);
@@ -113,7 +117,6 @@ export default function ScanScreen() {
         <Card tone="gold">
           <H2>Agregado al carrito (1 unidad)</H2>
           <HitDetails hit={result.hit} branchName={branchName} />
-          {result.hit.qty <= 0 ? <Banner kind="warn" text="La existencia local es 0 o negativa. La venta de emergencia no se bloquea, pero revisa que sí haya producto." /> : null}
           <Button title={`Ver carrito (${cart.units})`} onPress={() => router.push('/cart')} />
           <Button title="Quitar esta unidad" variant="secondary" onPress={() => { cart.changeQty(result.hit.variantId, (cart.cart.lines.find((l) => l.variantId === result.hit.variantId)?.qty ?? 1) - 1); setResult(null); }} />
         </Card>
@@ -128,9 +131,10 @@ export default function ScanScreen() {
               {mode === 'venta' ? (
                 <Button
                   title="Agregar al carrito (1)"
+                  disabled={h.qty <= 0}
                   onPress={() => {
-                    cart.add(h, 1);
-                    setNotice(`Agregado: ${h.productName} ${h.label}`);
+                    const blocked = cart.add(h, 1);
+                    setNotice(blocked ?? `Agregado: ${h.productName} ${h.label}`);
                     resume();
                   }}
                 />
@@ -201,7 +205,8 @@ function HitDetails({ hit, branchName }: { hit: CatalogHit; branchName: string }
       <H2>{hit.productName}</H2>
       <Row label="Variante" value={hit.label} strong />
       <Row label="Precio" value={formatMXN(hit.priceCents)} strong />
-      <Row label="Existencia (local)" value={String(hit.qty)} strong valueColor={hit.qty <= 0 ? colors.danger : undefined} />
+      <Row label="Existencia (local)" value={String(shownQty(hit.qty))} strong valueColor={hit.qty <= 0 ? colors.danger : undefined} />
+      {isLegacyNegative(hit.qty) ? <Banner kind="warn" text="Existencia por corregir: el inventario tiene un descuadre heredado. Avisa al gerente para ajustarlo." /> : null}
       <Row label="Sucursal" value={branchName} />
       <Row label="Lugar" value={hit.location ?? 'Sin lugar'} />
     </>

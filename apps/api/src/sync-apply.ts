@@ -14,6 +14,11 @@
  *    ajuste imposible). Lo rechazado queda en sync_conflicts con la operación original guardada.
  *  - El rol, la sucursal y los permisos temporales se LEEN DEL SERVIDOR; lo que diga el dispositivo
  *    sobre autorizaciones (grantId, authorizedBy) se ignora.
+ *  - v2: las acciones sensibles de un VENDEDOR (cerrar caja, cancelar, devolver) llevan `authorization`
+ *    (contraseña de un gerente o token). El servidor comprueba que existiera y fuera válida a la hora LOCAL
+ *    de la operación; si no, la operación (que ya ocurrió) se aplica y queda un conflicto `autorizacion_invalida`.
+ *    Sin ninguna autorización, un vendedor sigue siendo rechazado (`sin_permiso`).
+ *  - v2: una línea 'extra' suma al importe pero NO mueve inventario ni cuenta como unidad.
  *  - Sin transacciones: movimiento (único por _id) y luego $inc; reconcileStock repara cualquier hueco.
  */
 import {
@@ -26,6 +31,8 @@ import {
   SaleValidationError,
 } from '@amara/shared';
 import type {
+  ActionAuthorization,
+  CachedSecurityToken,
   CashBreakdown,
   CashMovement,
   ComputedSale,
@@ -48,6 +55,8 @@ import {
   stockMovementPayload,
 } from './sync-payloads.ts';
 import { deltaMatchesType } from './stock-math.ts';
+import { checkAuthorization } from './security.ts';
+import type { AuthzResult } from './security.ts';
 
 // ───────────────────────────── Contratos de datos ─────────────────────────────
 
@@ -101,6 +110,9 @@ export interface CashSessionRec {
   duplicateOpen?: boolean;
   closedAt?: string | null;
   closeOpId?: string | null;
+  /** v2. Quién autorizó el cierre. */
+  closeAuthorization?: ActionAuthorization | null;
+  closeAuthorizedBy?: string | null;
 }
 export interface CashData {
   sales: Pick<Sale, 'cashSessionId' | 'payments'>[];
@@ -108,7 +120,13 @@ export interface CashData {
   movements: Pick<CashMovement, 'sessionId' | 'type' | 'amountCents'>[];
 }
 export type StoredSale = Sale & { receivedAt: string; syncOpId: string; source: SyncSource };
-export type StoredAdjustment = SaleAdjustment & { receivedAt: string; syncOpId: string; source: SyncSource };
+export type StoredAdjustment = SaleAdjustment & {
+  receivedAt: string; syncOpId: string; source: SyncSource;
+  /** v2. Quién autorizó (contraseña de admin o token); null si la autorización declarada no fue válida. */
+  authorization?: ActionAuthorization | null;
+  /** v2. Gerente que autorizó (o el propio usuario si él tenía el permiso). */
+  authorizedBy?: string | null;
+};
 export type StoredMovement = InventoryMovement & { opId: string | null };
 export interface ConflictRec {
   id: string;
@@ -148,6 +166,15 @@ export interface SyncRepo {
   getTerminal(id: string): Promise<TerminalRec | null>;
   listGrants(sellerId: string, branchId: string): Promise<Grant[]>;
   getVariant(id: string): Promise<VariantRec | null>;
+  /** v2. Token de seguridad con su sal y hash (o null). */
+  getSecurityToken(id: string): Promise<CachedSecurityToken | null>;
+  /** v2. ¿Esta operación ya había registrado el uso de ese token? */
+  hasTokenUse(tokenId: string, opId: string): Promise<boolean>;
+  /**
+   * v2. Registra (una sola vez por operación) el uso de un token: 'consumed' la primera vez, 'already' si esa
+   * operación ya lo había contado (reproceso) y 'exhausted' si ya no quedaban usos (atómico respecto al máximo).
+   */
+  consumeToken(tokenId: string, opId: string, atIso: string): Promise<'consumed' | 'already' | 'exhausted'>;
 
   getSale(id: string): Promise<Sale | null>;
   insertSale(sale: StoredSale): Promise<boolean>;
@@ -331,6 +358,32 @@ async function loadActor(repo: SyncRepo, op: SyncOp, branchId: string): Promise<
   return { user };
 }
 
+/** ¿Qué rol puede hacer la acción por sí mismo? El gerente. El vendedor necesita autorización; los demás, nunca. */
+const needsAuthorization = (role: Role, perm: Parameters<typeof can>[1]) => !can(role, perm) && role === 'vendedor';
+
+/** Valida la autorización declarada con las reglas del servidor, a la hora local (nunca futura) de la operación. */
+function verifyAuthorization(repo: SyncRepo, raw: unknown, op: SyncOp, ctx: ApplyContext, purpose: 'cierre_caja' | 'devolucion' | 'cancelacion' | 'limpias', branchId: string): Promise<AuthzResult> {
+  const at = minIso(op.localTs, ctx.now().toISOString());
+  return checkAuthorization(repo, raw, { purpose, branchId, userId: op.userId, opId: op.opId, atIso: at });
+}
+
+/**
+ * Registra el uso del token (si la autorización era un token válido) y audita quién autorizó.
+ * Si el máximo de usos se agotó en una carrera, la operación ya ocurrida se conserva y se avisa.
+ */
+async function settleAuthorization(repo: SyncRepo, acc: Acc, r: AuthzResult, op: SyncOp, ctx: ApplyContext, action: string, entity: string, entityId: string, branchId: string): Promise<void> {
+  if (!r.ok) {
+    acc.add('autorizacion_invalida', r.detail);
+  } else if (r.tokenId) {
+    const used = await repo.consumeToken(r.tokenId, op.opId, ctx.now().toISOString());
+    if (used === 'exhausted') acc.add('autorizacion_invalida', 'El token alcanzó su máximo de usos antes de sincronizar esta operación');
+  }
+  await repo.audit({
+    id: `${op.opId}:autorizacion`, at: ctx.now().toISOString(), userId: op.userId, action: `autorizacion.${action}`, entity, entityId, branchId, terminalId: op.terminalId,
+    detail: r.ok ? { valid: true, authorization: r.authorization, authorizedBy: r.authorizedBy } : { valid: false, reason: r.detail },
+  });
+}
+
 // ───────────────────────────── sale.create ─────────────────────────────
 
 async function handleSaleCreate(repo: SyncRepo, op: SyncOp, ctx: ApplyContext): Promise<Outcome> {
@@ -350,7 +403,7 @@ async function handleSaleCreate(repo: SyncRepo, op: SyncOp, ctx: ApplyContext): 
   let calc: ComputedSale;
   try {
     calc = computeSale(
-      sale.items.map((i) => ({ variantId: i.variantId, qty: i.qty, unitPriceCents: i.unitPriceCents, unitCostCents: i.unitCostCents, lineDiscountCents: i.lineDiscountCents })),
+      sale.items.map((i) => ({ variantId: i.variantId, qty: i.qty, unitPriceCents: i.unitPriceCents, unitCostCents: i.unitCostCents, lineDiscountCents: i.lineDiscountCents, kind: i.kind ?? 'producto' })),
       sale.discountCents - lineDiscounts,
       sale.payments.map((p) => ({ method: p.method, amountCents: p.amountCents, tenderedCents: p.tenderedCents })),
     );
@@ -382,12 +435,18 @@ async function handleSaleCreate(repo: SyncRepo, op: SyncOp, ctx: ApplyContext): 
     else if (s.status === 'cerrada' && s.closedAt && sale.createdAt > s.closedAt) acc.add('venta_tras_corte', 'La venta es posterior al corte de su sesión de caja');
   }
 
+  // v2: Limpias. El gerente entra libremente; un vendedor necesita contraseña de admin o token 'limpias'.
+  const isLimpia = sale.type === 'limpia';
+  const limpiaCheck = isLimpia && needsAuthorization(user.role, 'caja.corte') ? await verifyAuthorization(repo, parsed.data.authorization, op, ctx, 'limpias', sale.branchId) : null;
+
   await repo.insertSale({ ...sale, status: 'completada', receivedAt: ctx.now().toISOString(), syncOpId: op.opId, source: ctx.source });
+  if (limpiaCheck) await settleAuthorization(repo, acc, limpiaCheck, op, ctx, 'limpias', 'sale', sale.id, sale.branchId);
 
   const negatives: string[] = [];
   const unknown: string[] = [];
   const cheaper: string[] = [];
   for (const [i, it] of sale.items.entries()) {
+    if (it.kind === 'extra') continue; // un extra es solo un cargo: sin movimiento de inventario ni existencias
     const v = await repo.getVariant(it.variantId);
     if (!v) {
       unknown.push(`${it.productName} ${it.variantLabel}`.trim());
@@ -412,7 +471,11 @@ async function handleSaleCreate(repo: SyncRepo, op: SyncOp, ctx: ApplyContext): 
 
   await repo.audit({
     id: `${op.opId}:venta`, at: ctx.now().toISOString(), userId: sale.userId, action: 'venta.crear', entity: 'sale', entityId: sale.id,
-    branchId: sale.branchId, terminalId: sale.terminalId, detail: { folio: sale.folio, totalCents: sale.totalCents, origin: ctx.source },
+    branchId: sale.branchId, terminalId: sale.terminalId,
+    detail: {
+      folio: sale.folio, totalCents: sale.totalCents, origin: ctx.source, type: sale.type ?? 'venta', sellerId: sale.sellerId ?? null,
+      extras: sale.items.filter((i) => i.kind === 'extra').length,
+    },
   });
   return acc.done();
 }
@@ -430,7 +493,17 @@ async function handleSaleAdjust(repo: SyncRepo, op: SyncOp, ctx: ApplyContext): 
   if ('fail' in actor) return actor.fail;
   const { user } = actor;
   const perm = adj.type === 'cancelacion' ? 'ventas.cancelar' : 'ventas.devolver';
-  if (!can(user.role, perm)) return reject('sin_permiso', `${user.name} (${user.role}) no puede registrar ${adj.type === 'cancelacion' ? 'cancelaciones' : 'devoluciones'}`);
+  const purpose = adj.type === 'cancelacion' ? 'cancelacion' : 'devolucion';
+  // v2: el vendedor solo puede si trae autorización (que se valida más abajo; si es inválida se aplica y se avisa).
+  let authz: AuthzResult | null = null;
+  if (!can(user.role, perm)) {
+    const label = adj.type === 'cancelacion' ? 'cancelaciones' : 'devoluciones';
+    if (!needsAuthorization(user.role, perm)) return reject('sin_permiso', `${user.name} (${user.role}) no puede registrar ${label}`);
+    if (parsed.data.authorization === undefined || parsed.data.authorization === null) {
+      return reject('sin_permiso', `${user.name} (${user.role}) no puede registrar ${label} sin autorización de un administrador`);
+    }
+    authz = await verifyAuthorization(repo, parsed.data.authorization, op, ctx, purpose, adj.branchId);
+  }
 
   const sale = await repo.getSale(adj.saleId);
   if (!sale) return reject('venta_no_encontrada', 'La venta del ajuste no existe en el servidor');
@@ -468,13 +541,17 @@ async function handleSaleAdjust(repo: SyncRepo, op: SyncOp, ctx: ApplyContext): 
       const s = await repo.getCashSession(adj.cashSessionId);
       if (!s) acc.add('caja_desconocida', 'El ajuste pertenece a una sesión de caja que el servidor no conoce');
     }
-    await repo.insertAdjustment({ ...adj, receivedAt: ctx.now().toISOString(), syncOpId: op.opId, source: ctx.source });
+    await repo.insertAdjustment({ ...adj, receivedAt: ctx.now().toISOString(), syncOpId: op.opId, source: ctx.source, authorization: authz?.ok ? authz.authorization : null, authorizedBy: authz?.ok ? authz.authorizedBy : user.id });
     if (adj.type === 'cancelacion') await repo.setSaleCancelled(sale.id);
   }
+  // Fuera del bloque anterior para que un reproceso termine de contar el uso del token y de auditar (todo es idempotente).
+  if (authz) await settleAuthorization(repo, acc, authz, op, ctx, adj.type === 'cancelacion' ? 'cancelacion' : 'devolucion', 'sale', sale.id, adj.branchId);
 
   const unknown: string[] = [];
   for (const [i, it] of adj.items.entries()) {
     if (!it.restock) continue; // producto dañado / merma: no regresa a existencias
+    // v2: una línea 'extra' (por lo vendido o por lo declarado en el ajuste) devuelve dinero, nunca existencias.
+    if (it.kind === 'extra' || sale.items.find((l) => l.id === it.saleItemId)?.kind === 'extra') continue;
     const v = await repo.getVariant(it.variantId);
     if (!v) {
       unknown.push(`${it.productName} ${it.variantLabel}`.trim());
@@ -491,7 +568,11 @@ async function handleSaleAdjust(repo: SyncRepo, op: SyncOp, ctx: ApplyContext): 
 
   await repo.audit({
     id: `${op.opId}:ajuste`, at: ctx.now().toISOString(), userId: adj.userId, action: `venta.${adj.type}`, entity: 'sale', entityId: sale.id,
-    branchId: adj.branchId, terminalId: adj.terminalId, detail: { folio: sale.folio, amountCents: adj.amountCents, reason: adj.reason, adjustmentId: adj.id },
+    branchId: adj.branchId, terminalId: adj.terminalId,
+    detail: {
+      folio: sale.folio, amountCents: adj.amountCents, reason: adj.reason, adjustmentId: adj.id,
+      authorizedBy: authz?.ok ? authz.authorizedBy : user.id, authorization: authz?.ok ? authz.authorization : null,
+    },
   });
   return acc.done();
 }
@@ -613,7 +694,15 @@ async function handleCashClose(repo: SyncRepo, op: SyncOp, ctx: ApplyContext): P
   if (session.branchId !== op.branchId) return reject('payload_inconsistente', 'La sesión de caja es de otra sucursal');
   const actor = await loadActor(repo, op, session.branchId);
   if ('fail' in actor) return actor.fail;
-  if (!can(actor.user.role, 'caja.corte')) return reject('sin_permiso', `${actor.user.name} (${actor.user.role}) no puede hacer cortes de caja`);
+  // v2: el vendedor solo puede cerrar con autorización (contraseña de admin o token 'cierre_caja').
+  let authz: AuthzResult | null = null;
+  if (!can(actor.user.role, 'caja.corte')) {
+    if (!needsAuthorization(actor.user.role, 'caja.corte')) return reject('sin_permiso', `${actor.user.name} (${actor.user.role}) no puede hacer cortes de caja`);
+    if (c.authorization === undefined || c.authorization === null) {
+      return reject('sin_permiso', `${actor.user.name} (${actor.user.role}) no puede hacer cortes de caja sin autorización de un administrador`);
+    }
+    authz = await verifyAuthorization(repo, c.authorization, op, ctx, 'cierre_caja', session.branchId);
+  }
   if (session.closeOpId === op.opId) return new Acc().done(); // reproceso de este mismo corte
   if (session.status === 'cerrada' && !session.duplicateOpen) return reject('ya_cerrada', 'La sesión de caja ya tiene un corte registrado');
 
@@ -622,6 +711,9 @@ async function handleCashClose(repo: SyncRepo, op: SyncOp, ctx: ApplyContext): P
   const breakdown: CashBreakdown = computeCashBreakdown(session.openingCents, session.id, data.sales, data.adjustments, data.movements);
   const difference = cashDifference(breakdown.expectedCents, c.countedCents);
   const acc = new Acc();
+  // Quien queda registrado como autorizador: el gerente es su propia autorización.
+  const closeAuthorization: ActionAuthorization | null = authz ? (authz.ok ? authz.authorization : null) : { kind: 'admin_password', adminUserId: actor.user.id };
+  const closeAuthorizedBy: string | null = authz ? (authz.ok ? authz.authorizedBy : null) : actor.user.id;
   const mismatch = c.expectedCents !== undefined && c.expectedCents !== breakdown.expectedCents;
   if (mismatch) {
     acc.add('corte_difiere', `El esperado de la terminal (${c.expectedCents}) no coincide con el del servidor (${breakdown.expectedCents}): faltan o sobran operaciones por sincronizar`);
@@ -632,12 +724,14 @@ async function handleCashClose(repo: SyncRepo, op: SyncOp, ctx: ApplyContext): P
     status: 'cerrada', closedBy: c.closedBy, closedAt: c.closedAt, countedCents: c.countedCents, expectedCents: breakdown.expectedCents,
     clientExpectedCents: c.expectedCents ?? null, differenceCents: difference, provisional, reconciliation: mismatch ? 'con_diferencias' : 'conciliado',
     denominations: c.denominations ?? null, notes: c.notes ?? null, closure: { breakdown }, closeOpId: op.opId, closeReceivedAt: ctx.now().toISOString(),
+    closeAuthorization, closeAuthorizedBy,
   });
   if (!ok) return reject('ya_cerrada', 'La sesión de caja ya tiene un corte registrado');
+  if (authz) await settleAuthorization(repo, acc, authz, op, ctx, 'cierre_caja', 'cash_session', session.id, session.branchId);
   await repo.audit({
     id: `${op.opId}:caja_cerrar`, at: ctx.now().toISOString(), userId: c.closedBy, action: 'caja.cerrar', entity: 'cash_session', entityId: session.id,
     branchId: session.branchId, terminalId: op.terminalId,
-    detail: { expectedCents: breakdown.expectedCents, countedCents: c.countedCents, differenceCents: difference, provisional },
+    detail: { expectedCents: breakdown.expectedCents, countedCents: c.countedCents, differenceCents: difference, provisional, authorization: closeAuthorization, authorizedBy: closeAuthorizedBy },
   });
   return acc.done();
 }

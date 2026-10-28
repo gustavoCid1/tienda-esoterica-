@@ -78,3 +78,46 @@ test('devoluciones parciales con redondeo acumulado suman el neto exacto', () =>
   assert.equal(a + b + c, net);
   assert.throws(() => refundAmountForLine(net, 3, 2, 2));
 });
+
+// ───────────────────────────── v2: líneas extra ─────────────────────────────
+
+test('v2 extra: suma al total, qty fija 1, costo 0 y conserva descuentos y pagos exactos', () => {
+  const r = computeSale(
+    [
+      { variantId: 'vela', qty: 2, unitPriceCents: 9000, unitCostCents: 4000 },
+      { variantId: 'vela', qty: 1, unitPriceCents: 2500, unitCostCents: 0, kind: 'extra' },
+    ],
+    0,
+    [{ method: 'efectivo', amountCents: 20500, tenderedCents: 21000 }],
+  );
+  assert.equal(r.subtotalCents, 20500);
+  assert.equal(r.totalCents, 20500);
+  assert.equal(r.changeCents, 500);
+  assert.equal(r.lines[1]!.kind, 'extra');
+  assert.equal(r.lines[1]!.netCents, 2500);
+});
+
+test('v2 extra: descuento general y de línea se reparten también sobre el extra, sin perder centavos', () => {
+  const r = computeSale(
+    [
+      { variantId: 'a', qty: 3, unitPriceCents: 3333, unitCostCents: 1 },
+      { variantId: 'a', qty: 1, unitPriceCents: 777, unitCostCents: 0, kind: 'extra', lineDiscountCents: 77 },
+    ],
+    501,
+    [{ method: 'tarjeta', amountCents: 3 * 3333 + 777 - 77 - 501 }],
+  );
+  assert.equal(r.lines.reduce((a, l) => a + l.netCents, 0), r.totalCents);
+  assert.equal(r.discountCents, 77 + 501);
+  assert.equal(r.totalCents, 9999 + 700 - 501);
+});
+
+test('v2 extra: precio 0 es válido; qty distinta de 1, costo distinto de 0 o precio negativo se rechazan', () => {
+  const pay = [{ method: 'efectivo' as const, amountCents: 9000 }];
+  const ok = computeSale([{ variantId: 'a', qty: 1, unitPriceCents: 9000, unitCostCents: 1 }, { variantId: 'a', qty: 1, unitPriceCents: 0, unitCostCents: 0, kind: 'extra' }], 0, pay);
+  assert.equal(ok.totalCents, 9000);
+  const bad = (line: any) => assert.throws(() => computeSale([line], 0, pay), SaleValidationError);
+  bad({ variantId: 'a', qty: 2, unitPriceCents: 9000, unitCostCents: 0, kind: 'extra' });
+  bad({ variantId: 'a', qty: 1, unitPriceCents: 9000, unitCostCents: 5, kind: 'extra' });
+  bad({ variantId: 'a', qty: 1, unitPriceCents: -1, unitCostCents: 0, kind: 'extra' });
+  bad({ variantId: 'a', qty: 1, unitPriceCents: 9000, unitCostCents: 0, kind: 'otra' });
+});

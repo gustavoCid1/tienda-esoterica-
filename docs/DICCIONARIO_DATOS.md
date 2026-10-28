@@ -3,7 +3,8 @@
 > Revisión: 22/10/2026.
 > - **Parte A (SQLite local)** está extraída línea por línea de `packages/database/src/schema.ts` (migración 1, `esquema_inicial`) y de las consultas de `packages/database/src/local-store.ts`. Es exacta respecto al código.
 > - **Parte B (MongoDB central)**: los **índices y restricciones** están extraídos de `apps/api/src/db.ts`; los **campos** se tomaron de las escrituras reales del código de la API (`seed.ts`, `routes/*.ts`, `sync-apply.ts`, `sync-repo.ts`, `stock.ts`, `audit.ts`) y de los tipos de `packages/shared`. Donde un campo solo se deduce del tipo compartido y no se vio una escritura en la API, se marca **(tipo)**. La API **no se ha ejecutado** contra una base real, así que el contenido real de los documentos podría diferir en detalles.
-> - Nada se ha ejecutado todavía; ver [README](../README.md), sección 0.
+> - **Núcleo v2**: la migración 2 (`v2_vendedor_extras_tokens_ajustes`, `packages/database/src/schema.ts`) y las colecciones/campos nuevos de la API están marcados con **v2**. La migración 1 no se tocó: la 2 es solo aditiva y se probó sobre datos de la versión 1.
+> - Nada se ha ejecutado todavía contra una base real; ver [README](../README.md), sección 0.
 
 ## Convenciones generales
 
@@ -103,7 +104,8 @@ Claves usadas por el código: `branch_id`, `branch_code`, `terminal_id`, `termin
 | `verifier` | TEXT | No | NULL | Hash derivado **tras un inicio de sesión en línea**; **nunca** la contraseña. Permite entrar sin internet. |
 | `updated_at` | TEXT | Sí | — | |
 
-**Reglas:** el `pull` actualiza todos los campos **menos `verifier`**. `getUserByUsername` solo devuelve usuarios con `active = 1`. El rol `desarrollador` existe aquí pero la app de escritorio no debe ofrecerlo para entrar al punto de venta (`DESKTOP_ROLES`).
+**v2:** en los **gerentes**, el `pull` trae el campo `verifier` (el hash scrypt de su contraseña, ya existente en el servidor) y se guarda aquí para poder validar la contraseña de un administrador SIN internet al autorizar cierres, cancelaciones, devoluciones y Limpias. Si el `pull` no lo trae, se conserva el anterior (`COALESCE`).
+**Reglas:** el `pull` actualiza todos los campos; `verifier` solo cuando viene informado. `getUserByUsername` solo devuelve usuarios con `active = 1`. El rol `desarrollador` existe aquí pero la app de escritorio no debe ofrecerlo para entrar al punto de venta (`DESKTOP_ROLES`).
 
 ### `products` — catálogo: producto
 | Campo | Tipo | Oblig. | Predet. | Notas |
@@ -170,9 +172,11 @@ Claves usadas por el código: `branch_id`, `branch_code`, `terminal_id`, `termin
 | `reconciliation` | TEXT | Sí | `'n/a'` | `CHECK` en `n/a`, `pendiente`, `conciliado`, `con_diferencias` |
 | `closure_json` | TEXT | No | NULL | Desglose completo del corte (importes por método, billetes y monedas) |
 | `notes` | TEXT | No | NULL | |
+| `close_authorization_json` | TEXT | No | NULL | **v2.** `ActionAuthorization` con que se cerró la caja. Si cierra el gerente: su propia identidad como `admin_password` |
+| `close_authorized_by` | TEXT | No | NULL | **v2.** Id del administrador que autorizó el cierre (el creador del token si fue token) |
 
 **Índices/restricciones:** índice **único parcial** `idx_one_open_session` sobre `terminal_id` donde `status = 'abierta'` → **solo una caja abierta por terminal**.
-**Reglas de actualización:** nunca se borra (trigger). Una sesión **cerrada** no puede cambiar `counted_cents`, `expected_cents`, `difference_cents`, `status`, `closure_json` ni `opening_cents` (trigger `cash_closed_immutable`). Sí pueden cambiar `reconciliation` (cuando el servidor confirma el corte), `provisional` y `notes`.
+**Reglas de actualización:** nunca se borra (trigger). Una sesión **cerrada** no puede cambiar `counted_cents`, `expected_cents`, `difference_cents`, `status`, `closure_json` ni `opening_cents` (trigger `cash_closed_immutable`). Sí pueden cambiar `reconciliation` (cuando el servidor confirma el corte), `provisional` y `notes`. **v2:** `close_authorization_json` y `close_authorized_by` no se modifican una vez escritos (trigger `cash_close_auth_immutable`). **No se puede cerrar sin autorización válida** (`LocalStore.closeCash` lanza `autorizacion_requerida`).
 El efectivo esperado = fondo + pagos en efectivo de la sesión + entradas − retiros − gastos − devoluciones/cancelaciones pagadas en efectivo. **Tarjeta y transferencia nunca se suman al efectivo.**
 
 ### `cash_movements` — entradas, retiros y gastos de efectivo
@@ -201,9 +205,12 @@ El efectivo esperado = fondo + pagos en efectivo de la sesión + entradas − re
 | `status` | TEXT | Sí | `'completada'` | `CHECK` en `completada`, `cancelada` |
 | `origin` | TEXT | Sí | `'local'` | `CHECK` en `local`, `lan` (`lan` = réplica recibida de un teléfono) |
 | `sync_state` | TEXT | Sí | `'pendiente'` | `CHECK` en `pendiente`, `sincronizada`, `conflicto` |
+| `seller_id`, `seller_name` | TEXT | No | NULL | **v2.** Quién vendió (puede no ser quien cobra en la caja). En ventas anteriores a v2 es NULL y se usa `user_id` / `user_name` |
+| `sale_type` | TEXT | Sí | `'venta'` | **v2.** `CHECK` en `venta`, `limpia`. Una Limpia es una venta normal que suma al total |
+| `authorization_json` | TEXT | No | NULL | **v2.** `ActionAuthorization` con que un vendedor hizo una Limpia (propósito `limpias`) |
 
-**Índices:** `idx_sales_created(created_at)`, `idx_sales_branch_created(branch_id, created_at)`, `idx_sales_session(cash_session_id)`.
-**Reglas de actualización:** no se borra (trigger `sales_no_delete`). Los campos de dinero, folio, usuario, sucursal, terminal, sesión y fecha **no se pueden modificar** (trigger `sales_immutable`). Solo cambian `status` (a `cancelada`, por una cancelación), `sync_state` y `origin`.
+**Índices:** `idx_sales_created(created_at)`, `idx_sales_branch_created(branch_id, created_at)`, `idx_sales_session(cash_session_id)`, **v2:** `idx_sales_type_created(sale_type, created_at)`.
+**Reglas de actualización:** no se borra (trigger `sales_no_delete`). Los campos de dinero, folio, usuario, sucursal, terminal, sesión y fecha **no se pueden modificar** (trigger `sales_immutable`). Solo cambian `status` (a `cancelada`, por una cancelación), `sync_state` y `origin`. **v2:** `seller_id`, `seller_name`, `sale_type` y `authorization_json` tampoco se pueden modificar (trigger `sales_v2_immutable`).
 
 ### `sale_items` — partidas de la venta (copia histórica)
 | Campo | Tipo | Oblig. | Predet. | Notas |
@@ -216,6 +223,8 @@ El efectivo esperado = fondo + pagos en efectivo de la sesión + entradas − re
 | `unit_price_cents`, `unit_cost_cents` | INTEGER | Sí | — | Precio y costo **al momento de la venta** |
 | `line_discount_cents` | INTEGER | Sí | `0` | |
 | `net_cents` | INTEGER | Sí | — | Importe final de la línea (incluye su parte del descuento general) |
+| `kind` | TEXT | Sí | `'producto'` | **v2.** `CHECK` en `producto`, `extra`. Un **extra** es un cargo adicional sobre un producto (p. ej. aceite en una veladora): `qty = 1`, costo 0, **no mueve inventario**, suma al importe pero no a unidades vendidas |
+| `extra_note` | TEXT | No | NULL | **v2.** Texto libre del extra ("Aceite de lavanda") |
 
 **Reglas:** triggers impiden `UPDATE` y `DELETE`. Un cambio posterior de precio o nombre en el catálogo **no** altera estas filas.
 
@@ -258,8 +267,10 @@ El efectivo esperado = fondo + pagos en efectivo de la sesión + entradas − re
 | `items_json` | TEXT | Sí | — | Partidas devueltas, con `restock` (si regresan a existencias) |
 | `cash_session_id` | TEXT | No | NULL | Caja de la que sale el efectivo devuelto |
 | `sync_state` | TEXT | Sí | `'pendiente'` | `CHECK` en `pendiente`, `sincronizada`, `conflicto` |
+| `authorization_json` | TEXT | No | NULL | **v2.** Autorización con que un vendedor canceló/devolvió |
+| `authorized_by` | TEXT | No | NULL | **v2.** Id del administrador que autorizó (el gerente que lo hace él mismo queda aquí) |
 
-**Reglas:** no se borra; `id`, `sale_id`, `type`, `created_at`, `amount_cents`, `payments_json`, `items_json`, `user_id` son inmutables. Una cancelación solo procede si la venta está `completada` y **no tiene devoluciones previas**; las devoluciones parciales usan redondeo acumulado para que la suma nunca exceda el neto de la línea. Se exige caja abierta si se devuelve efectivo.
+**Reglas:** no se borra; `id`, `sale_id`, `type`, `created_at`, `amount_cents`, `payments_json`, `items_json`, `user_id` son inmutables. Una cancelación solo procede si la venta está `completada` y **no tiene devoluciones previas**; las devoluciones parciales usan redondeo acumulado para que la suma nunca exceda el neto de la línea. Se exige caja abierta si se devuelve efectivo. **v2:** `authorization_json` y `authorized_by` son inmutables (trigger `adj_v2_immutable`). Un extra devuelto o cancelado regresa dinero pero **no** existencias (`restock = false`; en `items_json` cada partida lleva `kind`).
 
 ### `inventory_movements` — historial de inventario (fuente de verdad local)
 | Campo | Tipo | Oblig. | Predet. | Notas |
@@ -279,6 +290,29 @@ El efectivo esperado = fondo + pagos en efectivo de la sesión + entradas − re
 
 **Índices:** `idx_mov_variant(variant_id, branch_id, synced)`, `idx_mov_op(op_id)`.
 **Reglas:** no se borra; `id`, `variant_id`, `branch_id`, `delta`, `type`, `reason`, `user_id`, `created_at` son inmutables. Solo `synced` (y metadatos) cambian. `conteo` guarda la **diferencia** (contado − visible), no pisa la existencia.
+
+### `security_tokens_cache` — tokens de seguridad descargados (**v2**)
+**Finalidad:** validar un token SIN internet. Se llena en cada `pull` (`applyPull`); solo guarda `salt` y `hash`, nunca el código.
+
+| Campo | Tipo | Oblig. | Predet. | Notas |
+|---|---|---|---|---|
+| `id` | TEXT | Sí | — | PK (id del token en el servidor) |
+| `label` | TEXT | Sí | `''` | Nombre que le puso el gerente |
+| `hash`, `salt` | TEXT | Sí | — | `sha256(salt:CODIGO)` y su sal |
+| `purposes` | TEXT | Sí | `'[]'` | JSON: `cierre_caja`, `devolucion`, `cancelacion`, `limpias` |
+| `branch_id` | TEXT | No | NULL | NULL = cualquier sucursal |
+| `for_user_id` | TEXT | No | NULL | Si viene, solo ese usuario puede usarlo |
+| `created_by`, `created_at` | TEXT | No | NULL | |
+| `expires_at` | TEXT | Sí | — | Índice `idx_tokens_cache_expires` |
+| `revoked_at` | TEXT | No | NULL | |
+| `max_uses` | INTEGER | No | NULL | NULL = ilimitado |
+| `used_count` | INTEGER | Sí | `0` | |
+| `fetched_at` | TEXT | No | NULL | Cuándo se descargó |
+
+**Reglas:** el `pull` reemplaza la caché con lo que manda el servidor. Un uso sin conexión no se cuenta aquí: el servidor lo cuenta al sincronizar la operación (`authorization.tokenId`).
+
+### `app_settings` — configuración sincronizada (**v2**)
+`key TEXT PK`, `value TEXT NOT NULL` (JSON), `updated_at TEXT NOT NULL`. Clave usada: `extraCategories` (arreglo de categorías que admiten "Extra"; por omisión Veladoras, Pulseras, Imágenes, Lociones). Se actualiza con el `pull` (`settings.extraCategories`). Distinta de `meta`, que es identidad y estado del dispositivo.
 
 ### `sync_queue` — cola persistente de sincronización
 | Campo | Tipo | Oblig. | Predet. | Notas |
@@ -368,6 +402,9 @@ Sin triggers. `logBackup` también guarda `last_backup_<kind>_at` en `meta` si `
 | `cash_mov_no_delete`, `cash_mov_no_update` | Movimientos de efectivo intocables |
 | `cash_sessions_no_delete`, `cash_closed_immutable` | Cortes no se borran; un corte cerrado no cambia sus cifras |
 | `audit_no_delete`, `audit_no_update` | La auditoría es solo-agregar |
+| **v2** `sales_v2_immutable` | `seller_id`, `seller_name`, `sale_type`, `authorization_json` de una venta no cambian |
+| **v2** `cash_close_auth_immutable` | La autorización de un corte ya escrita no cambia |
+| **v2** `adj_v2_immutable` | La autorización de una cancelación/devolución no cambia |
 
 **Límite honesto:** estos triggers protegen contra errores del programa y contra `UPDATE`/`DELETE` normales. **No protegen** a alguien con acceso al archivo `.sqlite` y una herramienta que elimine los triggers, o contra borrar el archivo completo. Para eso existen los respaldos externos ([RESPALDOS.md](RESPALDOS.md)) y la copia en la nube.
 
@@ -377,7 +414,7 @@ Sin triggers. `logBackup` también guarda `last_backup_<kind>_at` en `meta` si `
 |---|---|
 | Tabla de transferencias | No existe. Las transferencias se hacen en línea y llegan por `pull` como cambios de existencia. |
 | Tabla de cortes | Un corte es una fila de `cash_sessions` cerrada (con `closure_json`). |
-| Tabla de configuración | Se usa `meta`. |
+| Tabla de configuración | Se usa `meta` (identidad del dispositivo) y, desde v2, `app_settings` (configuración sincronizada). |
 | Catálogo editable sin conexión | No: solo se descarga. No hay operaciones `product.*` en la cola. |
 
 ---
@@ -440,7 +477,7 @@ Convención: todo documento tiene `_id` (UUID de texto, salvo los indicados) e `
 `_id/id`; `code` (**único**; 1–4 caracteres, mayúsculas y números); `name` (2–80); `address` (o null); `locations` string[] (ubicaciones, ≤ 60 caracteres c/u); `status` (`activa`…); `createdAt`, `updatedAt`. El `seed` crea "Sucursal 1" y "Sucursal 2" (códigos en `seed-lib.ts`).
 
 ### `terminals`
-`_id/id`; `code` (**único**; 1–3 caracteres mayúsculas/números); `name`; `branchId` (índice); `kind` (`escritorio` \| `movil`); `revoked` (boolean); `tokenVersion` (número); `lastSyncAt`, `lastPullAt` (se actualizan en cada sync); `createdAt`, `updatedAt`.
+`_id/id`; `code` (**único**; 1–3 caracteres mayúsculas/números); `name`; `branchId` (índice); `kind` (`escritorio` \| `movil`); **v2:** `assignedTo` (nombre de la persona para quien es, o null; el código y el nombre se generan solos si no se escriben: `P1`/`M1`…, "PC de Ana"); `revoked` (boolean); `tokenVersion` (número); `lastSyncAt`, `lastPullAt` (se actualizan en cada sync); `createdAt`, `updatedAt`.
 **Regla:** el token de terminal solo vale si `revoked` es falso y su versión coincide con `tokenVersion` (para anularlo: revocar o subir la versión). El `seed` crea una terminal por sucursal.
 
 ### `products`
@@ -462,14 +499,14 @@ Convención: todo documento tiene `_id` (UUID de texto, salvo los indicados) e `
 `_id/id` (lo genera el cliente → reintento seguro), `fromBranchId`, `toBranchId`, `items` [{`variantId`, `qty` > 0}], `note?` (≤ 200), `userId`, `createdAt`. **Índice:** `createdAt ↓`. Exige que origen ≠ destino, que el usuario tenga acceso a ambas sucursales, que las variantes estén activas y que haya existencia suficiente en el origen. Genera una salida y una entrada; **no es una venta**.
 
 ### `sales`
-`_id/id` y los campos del tipo `Sale`: `folio`, `branchId`, `terminalId`, `userId`, `userName`, `cashSessionId`, `createdAt`, `subtotalCents`, `discountCents`, `totalCents`, `tenderedCents`, `changeCents`, `status`, **`items[]`** (copia histórica de cada partida) y **`payments[]`**; más `receivedAt`, `syncOpId` y `source` (`terminal` \| `usuario` \| `servidor`). Las partidas y pagos van **incrustados** (no hay colecciones `sale_items` ni `payments`). **Índices:** `(branchId, createdAt ↓)`; `folio` (**no único**; ver "Inconsistencias"); `(userId, createdAt ↓)`; `cashSessionId`; `createdAt ↓`.
+`_id/id` y los campos del tipo `Sale`: `folio`, `branchId`, `terminalId`, `userId`, `userName`, `cashSessionId`, `createdAt`, `subtotalCents`, `discountCents`, `totalCents`, `tenderedCents`, `changeCents`, `status`, **`items[]`** (copia histórica de cada partida) y **`payments[]`**; más `receivedAt`, `syncOpId` y `source` (`terminal` \| `usuario` \| `servidor`). **v2:** `sellerId`, `sellerName` (quién vendió; en ventas viejas faltan y se usa `userId`/`userName`), `type` (`venta` \| `limpia`, por omisión `venta`) y `authorization` (solo Limpias de un vendedor); cada partida lleva `kind` (`producto` \| `extra`) y `extraNote`. Las partidas y pagos van **incrustados** (no hay colecciones `sale_items` ni `payments`). **Índices:** `(branchId, createdAt ↓)`; `folio` (**no único**; ver "Inconsistencias"); `(userId, createdAt ↓)`; `cashSessionId`; `createdAt ↓`.
 **Reglas:** idempotente por `_id`. No se modifica el importe; `status` pasa a `cancelada` solo por un ajuste aceptado.
 
 ### `sale_adjustments` (solo se agregan)
-Campos del tipo `SaleAdjustment`: `_id/id`, `saleId`, `branchId`, `terminalId`, `userId`, `type` (`cancelacion` \| `devolucion`), `createdAt`, `reason`, `amountCents`, `payments[]`, `items[]` (con `restock`), `cashSessionId`; más `receivedAt`, `syncOpId`, `source`. **Índices:** `saleId`; `(branchId, createdAt ↓)`; `cashSessionId`.
+Campos del tipo `SaleAdjustment`: `_id/id`, `saleId`, `branchId`, `terminalId`, `userId`, `type` (`cancelacion` \| `devolucion`), `createdAt`, `reason`, `amountCents`, `payments[]`, `items[]` (con `restock` y, v2, `kind`), `cashSessionId`; más `receivedAt`, `syncOpId`, `source`. **v2:** `authorization` (la que declaró el vendedor, o null) y `authorizedBy` (id del administrador; el gerente que lo hace él mismo queda aquí). **Índices:** `saleId`; `(branchId, createdAt ↓)`; `cashSessionId`.
 
 ### `cash_sessions`
-`_id/id`, `branchId`, `terminalId`, `openedBy`, `openedAt`, `openingCents`, `status` (`abierta`/`cerrada`); al cerrar: `closedBy`, `closedAt`, `countedCents`, `expectedCents` (**lo calcula el servidor**), `clientExpectedCents` (el que mandó el dispositivo), `differenceCents`, `provisional`, `reconciliation` (`conciliado` \| `con_diferencias`), `denominations`, `notes`, `closure` ({`breakdown`}), `closeOpId`, `closeReceivedAt`; `duplicateOpen` (true si llegó por sincronización cuando la terminal ya tenía otra caja abierta). **Índices:** `terminalId` **único parcial donde `status = 'abierta'`** (una caja abierta por terminal garantizada por la base); `(branchId, openedAt ↓)`.
+`_id/id`, `branchId`, `terminalId`, `openedBy`, `openedAt`, `openingCents`, `status` (`abierta`/`cerrada`); al cerrar: `closedBy`, `closedAt`, `countedCents`, `expectedCents` (**lo calcula el servidor**), `clientExpectedCents` (el que mandó el dispositivo), `differenceCents`, `provisional`, `reconciliation` (`conciliado` \| `con_diferencias`), `denominations`, `notes`, `closure` ({`breakdown`}), `closeOpId`, `closeReceivedAt`; `duplicateOpen` (true si llegó por sincronización cuando la terminal ya tenía otra caja abierta). **v2:** `closeAuthorization` (`ActionAuthorization` o null si fue inválida) y `closeAuthorizedBy`. **Índices:** `terminalId` **único parcial donde `status = 'abierta'`** (una caja abierta por terminal garantizada por la base); `(branchId, openedAt ↓)`.
 
 ### `cash_movements` (solo se agregan)
 `_id/id`, `sessionId` (índice), `type` (`entrada`/`retiro`/`gasto`), `amountCents` (> 0), `concept` (3–200), `userId`, `createdAt`, `receivedAt`, `syncOpId`.
@@ -487,7 +524,17 @@ Campos del tipo `SaleAdjustment`: `_id/id`, `saleId`, `branchId`, `terminalId`, 
 `_id`, `id`, `at`, `userId` (o null), `action`, `entity` (o null), `entityId` (o null), `branchId` (o null), `terminalId` (o null), `detail` (o null). Los eventos sincronizados usan un `_id` determinista (`<opId>:<acción>`). **Índices:** `at ↓`; `(entity, entityId)`. La API solo inserta.
 
 ### `settings`
-Configuración general. Colección declarada en `COLLECTIONS`, sin índices; **no se encontró ninguna escritura en la API** a la fecha de esta revisión.
+Configuración general, un documento por llave: `_id` = llave. **v2:** `_id: 'extraCategories'` → `{ value: string[], updatedAt, updatedBy }` (lo escribe `PUT /settings/extra-categories`; sin documento rige la lista de fábrica). Sin índices.
+
+### `security_tokens` (**v2**)
+`_id/id`, `label`, `purposes[]` (`cierre_caja`, `devolucion`, `cancelacion`, `limpias`), `branchId` (o null = todas las del gerente), `forUserId` (o null), `createdBy`, `createdAt`, `expiresAt`, `revokedAt` (o null), `revokedBy`, `maxUses` (o null), `usedCount`, `lastUsedAt`, **`salt` y `hash`** (`sha256(salt:CODIGO)`). **El código en claro NO se guarda nunca**: solo se muestra una vez al crearlo. **Índices:** `createdAt ↓`; `(branchId, expiresAt ↓)`; `expiresAt`; `revokedAt`; `(createdBy, createdAt ↓)`.
+**Reglas:** el estado (`vigente`, `vencido`, `revocado`, `agotado`, `pendiente`) se calcula, no se guarda. Un token se revoca, no se borra. Se audita crear y revocar.
+
+### `security_token_uses` (**v2**)
+`_id` = **`<tokenId>:<opId>`**, `tokenId`, `opId`, `at`. Una marca por (token, operación): hace **idempotente** el conteo de usos al reprocesar una operación. **Índices:** `(tokenId, at ↓)`; `opId`.
+
+### `security_verifications` (**v2**)
+`_id`, `requesterKey` (`u:<usuario>` o `t:<terminal>`), `userId`, `purpose`, `branchId`, `authorization`, `authorizedBy`, `createdAt`, `expireAt` (fecha BSON). Resultado de `POST /security/verify`: vale **10 minutos y se usa una sola vez** (la ruta de cerrar/cancelar/devolver la borra). **Índices:** TTL sobre `expireAt` (Mongo la borra sola); `(requesterKey, purpose, branchId)`. No guarda código ni contraseña.
 
 ### `backups_log`
 Lo escribe `npm run backup:mongo`: `_id/id`, `at`, `kind` (`ndjson`), `dir`, `ok`, `durationMs`, `files[]` ({`collection`, `count`, `bytes`, `sha256`, `verified`, `error?`}). Se consulta con `GET /admin/backups`. Sin índices.

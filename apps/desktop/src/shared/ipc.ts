@@ -5,7 +5,7 @@
  *   proceso principal vuelve a validar sesión y permisos en CADA llamada (ocultar un botón
  *   en pantalla nunca es la seguridad).
  */
-import type { CashBreakdown, CashMovementType, PaymentInput, PaymentMethod, Role, Sale, SaleAdjustment, SalesSummary } from '@amara/shared';
+import type { CashBreakdown, CashMovementType, PaymentInput, PaymentMethod, Role, Sale, SaleAdjustment, SalesSummary, SaleType, TokenPurpose } from '@amara/shared';
 import type { CatalogHit } from '@amara/database';
 import type { AppSettings } from './settings.ts';
 
@@ -53,6 +53,68 @@ export interface VariantRow {
 export interface SaleRow {
   id: string; folio: string; userId: string; userName: string; terminalId: string;
   createdAt: string; totalCents: number; status: 'completada' | 'cancelada'; syncState: string; origin: string;
+  /** v2. 'limpia' = servicio de Limpias. */
+  type?: SaleType;
+}
+
+/** v2. Empleado que puede figurar como vendedor de una venta (usuarios activos de la sucursal). */
+export interface SellerRow { id: string; name: string; role: 'gerente' | 'vendedor' }
+
+/**
+ * v2. Boleto de autorización: lo entrega el proceso principal tras validar la contraseña de un administrador o un
+ * token. La pantalla solo lo devuelve en la acción siguiente; nunca contiene la contraseña ni el código.
+ */
+export interface AuthTicket {
+  ticket: string;
+  via: 'token' | 'admin_password';
+  /** Quién autorizó (administrador o quien emitió el token). */
+  byName: string | null;
+  tokenLabel: string | null;
+  /** true = lo validó el servidor en línea; false = la caché local de este equipo. */
+  online: boolean;
+}
+
+/** v2. Cómo se autoriza una acción sensible: el gerente confirma SU contraseña; el vendedor presenta un boleto. */
+export interface SensitiveAuth { password?: string; ticket?: string }
+
+/** v2. Línea de venta enviada al proceso principal (un 'extra' lleva el cargo y la nota). */
+export interface SaleItemReq {
+  variantId: string;
+  qty: number;
+  kind?: 'producto' | 'extra';
+  unitPriceCents?: number;
+  extraNote?: string;
+}
+
+/** v2. Documento imprimible con vista previa. */
+export type DocRequest =
+  | { kind: 'ticket'; saleId: string }
+  | { kind: 'closure'; sessionId: string }
+  | {
+      kind: 'permit';
+      permit: {
+        code: string; label: string; purposes: TokenPurpose[]; createdAt: string; expiresAt: string;
+        branchId: string | null; forUserId: string | null; maxUses: number | null;
+      };
+    };
+
+export interface DocPreview {
+  title: string;
+  paperMm: 58 | 80;
+  /** Cada página es el HTML EXACTO que se manda a la impresora (ticket: copia cliente y copia tienda). */
+  pages: { label: string; html: string }[];
+}
+
+export interface DocActionResult extends PrintResult {
+  /** Solo 'pdf': ruta del archivo guardado, o null si se canceló el diálogo. */
+  savedPath?: string | null;
+}
+
+/** v2. Token del servidor tal como lo lista GET /security/tokens (sin hash ni código). */
+export interface TokenRowView {
+  id: string; label: string; purposes: TokenPurpose[]; branchId: string | null; forUserId: string | null;
+  createdBy: string; createdAt: string; expiresAt: string; revokedAt: string | null; maxUses: number | null; usedCount: number;
+  status: string;
 }
 
 export interface SaleDetail {
@@ -70,6 +132,8 @@ export interface CashStatus {
   openedAt: string | null;
   /** Solo el gerente recibe importes. */
   openingCents: number | null;
+  /** v2. Quién abrió la caja. */
+  openedByName: string | null;
 }
 
 export interface CashClosureResult {
@@ -78,6 +142,11 @@ export interface CashClosureResult {
   countedCents: number;
   differenceCents: number;
   provisional: boolean;
+  closedAt: string;
+  /** v2. Quién autorizó el cierre. */
+  authorizedByName: string | null;
+  /** v2. true = el vendedor cerró a ciegas: los importes vienen en 0 y no se le muestran. */
+  redacted: boolean;
 }
 
 export interface ClosureRow {
@@ -204,7 +273,14 @@ export interface IpcMap {
   'catalog:createProduct': { req: NewProductInput; res: { created: true } };
 
   'sales:create': {
-    req: { saleId: string; items: { variantId: string; qty: number }[]; discountCents: number; payments: PaymentInput[] };
+    req: {
+      saleId: string; items: SaleItemReq[]; discountCents: number; payments: PaymentInput[];
+      /** v2. Empleado que vendió (se valida contra los usuarios de la sucursal; NO se imprime). */
+      sellerId: string;
+      /** v2. 'limpia' = Limpias (el vendedor necesita `ticket` con propósito 'limpias'). */
+      type?: SaleType;
+      ticket?: string;
+    };
     res: { sale: Sale; duplicate: boolean; warnings: string[] };
   };
   'sales:list': {
@@ -212,14 +288,32 @@ export interface IpcMap {
     res: SaleRow[];
   };
   'sales:detail': { req: { id: string }; res: SaleDetail };
-  'sales:cancel': { req: { saleId: string; reason: string; password: string; adjustmentId: string }; res: SaleAdjustment };
+  'sales:cancel': { req: { saleId: string; reason: string; adjustmentId: string } & SensitiveAuth; res: SaleAdjustment };
   'sales:refund': {
     req: {
-      saleId: string; reason: string; password: string; adjustmentId: string; method?: PaymentMethod;
+      saleId: string; reason: string; adjustmentId: string; method?: PaymentMethod;
       lines: { saleItemId: string; qty: number; restock: boolean }[];
-    };
+    } & SensitiveAuth;
     res: SaleAdjustment;
   };
+
+  'sellers:list': { req: undefined; res: SellerRow[] };
+  'catalog:categories': { req: undefined; res: string[] };
+  'security:verify': { req: { purpose: TokenPurpose; code?: string; adminPassword?: string }; res: AuthTicket };
+  'extras:get': { req: undefined; res: { categories: string[] } };
+  'extras:set': { req: { categories: string[] }; res: { categories: string[]; savedOnServer: boolean } };
+  'tokens:list': { req: undefined; res: TokenRowView[] };
+  'tokens:create': {
+    req: {
+      label: string; purposes: TokenPurpose[]; durationMinutes: number; branchId: string | null; maxUses: number | null;
+      length: number; forUserId: string | null; password: string;
+    };
+    res: { id: string; code: string; expiresAt: string };
+  };
+  'tokens:revoke': { req: { id: string }; res: true };
+  'print:preview': { req: DocRequest; res: DocPreview };
+  'print:document': { req: { doc: DocRequest; action: 'print' | 'pdf' }; res: DocActionResult };
+  'labels:savePdf': { req: { html: string; widthMm: number; heightMm: number }; res: { savedPath: string | null } };
 
   'inventory:permissions': {
     req: undefined;
@@ -233,9 +327,9 @@ export interface IpcMap {
   'cash:status': { req: undefined; res: CashStatus };
   'cash:open': { req: { openingCents: number }; res: { sessionId: string } };
   'cash:movement': { req: { type: CashMovementType; amountCents: number; concept: string }; res: true };
-  'cash:breakdown': { req: undefined; res: { sessionId: string; openedAt: string; breakdown: CashBreakdown } | null };
+  'cash:breakdown': { req: undefined; res: { sessionId: string; openedAt: string; openedByName: string | null; breakdown: CashBreakdown } | null };
   'cash:close': {
-    req: { countedCents: number; denominations: Record<string, number>; notes: string; password: string };
+    req: { countedCents: number; denominations: Record<string, number>; notes: string } & SensitiveAuth;
     res: CashClosureResult;
   };
   'cash:closures': { req: undefined; res: ClosureRow[] };
@@ -279,6 +373,9 @@ export const CHANNEL_NAMES: Record<IpcChannel, true> = {
   'backup:state': true, 'backup:now': true, 'backup:list': true,
   'lan:state': true, 'lan:startPairing': true, 'lan:cancelPairing': true, 'lan:revoke': true, 'lan:setEnabled': true,
   'labels:history': true, 'labels:saveBatch': true,
+  'sellers:list': true, 'catalog:categories': true, 'security:verify': true, 'extras:get': true, 'extras:set': true,
+  'tokens:list': true, 'tokens:create': true, 'tokens:revoke': true,
+  'print:preview': true, 'print:document': true, 'labels:savePdf': true,
 };
 
 // ───────────── Eventos main -> renderer ─────────────
