@@ -1,0 +1,40 @@
+# Instalador NSIS para Windows.
+# DATOS FUERA DE LA CARPETA DE INSTALACIÓN: la base SQLite, ajustes y secretos viven en
+#   %APPDATA%\Esoterica Amara\   (ver src/main/paths.ts)
+# y el desinstalador NO los borra (deleteAppDataOnUninstall: false). Actualizar o reinstalar
+# la aplicación nunca toca ventas, inventario ni respaldos.
+appId: mx.esotericaamara.pos
+productName: Esoterica Amara
+copyright: Esotérica Amara
+directories:
+  output: release
+  buildResources: build
+files:
+  - out/**/*
+  - package.json
+asar: true
+asarUnpack:
+  - "**/node_modules/better-sqlite3/**/*"
+# Recursos junto al ejecutable (resources\): logo para tickets y scripts de respaldo de Windows.
+extraResources:
+  - from: assets/logo-ticket.png
+    to: logo-ticket.png
+  - from: ../../scripts/windows
+    to: scripts
+    filter:
+      - "*.ps1"
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: build/icon.png
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Esoterica Amara
+  include: build/installer.nsh

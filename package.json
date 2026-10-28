@@ -1,0 +1,29 @@
+{
+  "name": "esoterica-amara",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sistema integral de inventario, punto de venta y caja de Esotérica Amara",
+  "workspaces": [
+    "packages/*",
+    "apps/api",
+    "apps/web",
+    "apps/desktop",
+    "apps/mobile"
+  ],
+  "scripts": {
+    "instalar": "npm install",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "build:shared": "npm run build -w @amara/shared && npm run build -w @amara/sync",
+    "dev:api": "npm run dev -w @amara/api",
+    "dev:web": "npm run dev -w @amara/web",
+    "dev:desktop": "npm run dev -w @amara/desktop",
+    "dev:mobile": "npm run start -w @amara/mobile",
+    "build:web": "npm run build -w @amara/web",
+    "build:desktop": "npm run dist -w @amara/desktop",
+    "seed": "npm run seed -w @amara/api"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}

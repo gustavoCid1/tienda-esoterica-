@@ -1,0 +1,44 @@
+{
+  "name": "@amara/desktop",
+  "productName": "Esoterica Amara",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Punto de venta de escritorio (Windows) de Esotérica Amara: ventas, caja e inventario sin internet",
+  "author": "Esotérica Amara",
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "rebuild": "electron-rebuild -f -w better-sqlite3",
+    "dist": "npm run rebuild && npm run build && electron-builder --win nsis --publish never",
+    "typecheck": "tsc -p tsconfig.node.json && tsc -p tsconfig.web.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0"
+  },
+  "devDependencies": {
+    "@amara/database": "*",
+    "@amara/shared": "*",
+    "@amara/sync": "*",
+    "@electron/rebuild": "^3.7.1",
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/jsbarcode": "^3.11.4",
+    "@types/node": "^22.9.0",
+    "@types/qrcode": "^1.5.5",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^2.3.0",
+    "jsbarcode": "^3.11.6",
+    "qrcode": "^1.5.4",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.5"
+  }
+}

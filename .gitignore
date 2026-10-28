@@ -1,0 +1,17 @@
+node_modules/
+dist/
+build/
+out/
+release/
+.expo/
+.env
+.env.*
+!.env.example
+*.log
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+backups/
+.DS_Store
+coverage/
